@@ -90,10 +90,11 @@ function mountViewer(root, program, options = {}) {
       slider.min = f.min; slider.max = f.max;
       slider.step = f.step ?? (f.scalar === 'f32' ? (f.max - f.min) / 200 : 1);
       slider.value = f.value;
-      const readout = row.appendChild(el('span', 'cg-readout', String(f.value)));
+      const show = (v) => (f.scalar === 'f32' ? v.toFixed(3) : String(v));
+      const readout = row.appendChild(el('span', 'cg-readout', show(f.value)));
       slider.addEventListener('input', () => {
         const v = f.scalar === 'f32' ? parseFloat(slider.value) : parseInt(slider.value, 10);
-        readout.textContent = f.scalar === 'f32' ? v.toFixed(3) : String(v);
+        readout.textContent = show(v);
         set(f.name, v);
       });
     } else if (f.ui === 'color') {
