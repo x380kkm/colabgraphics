@@ -1,25 +1,32 @@
 # colabgraphics
 
-在 Google Colab 里学习和原型化实时图形算法的环境。出发点是把
-[Gigi](https://github.com/electronicarts/gigi)（EA 的渲染技术快速原型工具）带到 Colab：
-着色器和渲染图写在 notebook 单元格里，编译在 Colab 的 VM 里完成，渲染用 WebGPU 跑在读者自己的浏览器里。
+在 Google Colab 里学习和原型化实时图形算法的环境。
 
-当前阶段：**可行性验证完成，正式开发刚开始**。仓库里目前只有验证用的实验代码。
+它是一个 Colab 原生的项目，**设计上借鉴** [Gigi](https://github.com/electronicarts/gigi)
+（EA 的渲染技术快速原型工具）的交互体验和编译器做法，但不运行 Gigi 本身，也不依赖它的编译器：
+作者只描述"有哪些资源、哪些变量、依次跑哪些 pass"并写着色器的算法部分，
+资源创建、绑定、管线、每帧调度、变量界面这些样板由系统生成。
+描述和着色器写在 notebook 单元格里，渲染用 WebGPU 跑在读者自己的浏览器里。
 
-![Gigi 的 boxblur 在未登录、未连接运行时的 Colab 里渲染](docs/images/gigi_boxblur_in_colab_no_runtime.jpg)
+当前阶段：**平台可行性验证完成，原生项目的设计进行中**。仓库里目前只有验证用的实验代码。
+
+![一个 WebGPU 技术在未登录、未连接运行时的 Colab 里渲染](docs/images/gigi_boxblur_in_colab_no_runtime.jpg)
 
 上图是真实的 Colab 页面：没有登录，没有连接运行时，单元格的输出是保存在 notebook 文件里的一段自包含 HTML，
-其中的 Gigi 技术（boxblur）用 WebGPU 实时渲染。
+其中的技术用 WebGPU 实时渲染。验证平台时用的负载是 Gigi 生成的 boxblur 示例，它在这里只是替身。
 
 ## 架构
 
 | 部件 | 在哪里运行 | 作用 |
 |---|---|---|
-| 编译器 | Colab VM | Linux 版 GigiCompiler + Slang，把 `.gg` 渲染图编译成 JS 模块和 WGSL |
-| 参考执行器 | Colab VM | Node + Dawn + 软件 Vulkan 无头运行同一个模块：同步读回、断言、CI |
+| 技术描述 | notebook 单元格 | 用 Python 声明资源、变量和 pass；着色器用 WGSL 只写算法部分 |
+| 编译器 | Colab VM（Python） | 校验描述，推导尺寸与格式，为着色器生成绑定声明和变量结构体，产出给运行时执行的程序 |
+| 运行时 | 浏览器，以及 VM 里的无头环境 | 同一份程序在读者的 GPU 上实时运行，也能在 VM 里无头运行以便同步读回、断言和 CI |
 | 快照查看器 | 读者的浏览器 | `show()` 输出的自包含 HTML，存进 notebook，重开后不需要运行时 |
 | 工作台 | 浏览器 ↔ VM | Gradio 式路径（VM 里的 HTTP 服务 + iframe）：改着色器、重编译、调试 |
-| 调试层 | 两个执行器共用 | 包一层 WebGPU 的 encoder，以 Gigi 生成的调试组为节点边界做快照、计时、校验 |
+| 调试层 | 运行时内 | 每个 pass 之后的资源快照、像素探针、计时、校验信息回指到单元格 |
+
+编译器、运行时和调试层尚未实现；上表是设计方向，细节以后续提交为准。
 
 ## 已经实测的事实
 
@@ -37,10 +44,14 @@ Colab VM（官方 [backend-info](https://github.com/googlecolab/backend-info)，
 - Ubuntu 24.04.5，Python 3.13.18；gradio、anywidget 预装。
 - apt 和 pip 清单里没有 Node，也没有 Vulkan 驱动。
 
-内核侧执行器（无 GPU 的 Linux，Dawn 的 Node 绑定 + SwiftShader，见 `experiments/dawn-node`）：
+无头运行 WebGPU（无 GPU 的 Linux，Dawn 的 Node 绑定，见 `experiments/dawn-node`）：
 
-- Gigi 自带的 50 个 WebGPU 测试中 47 个跑完；12 个与 gold 逐位一致，22 个最多差 2/255，13 个只在边缘像素有差异，3 个光追测试超时。
-- 生成代码里有两处 Windows 路径习惯在 Linux 上失效（文件名大小写、`./assets/../x.png`），影响 11 个测试。
+- 默认找不到 Vulkan 驱动；指向 SwiftShader 后可用，得到完整的 WebGPU 核心功能。
+- 不装任何 Vulkan 驱动也行：Dawn 的 OpenGL ES 后端可以跑在 Mesa 的软件渲染上（需要让 `libEGL.so` 这个名字能被找到），
+  得到的是 WebGPU 兼容模式，功能少一些。Colab 镜像预装了所需的 Mesa 包；这一点还没在 Colab 的 VM 里实测。
+- 作为负载，Gigi 自带的 50 个 WebGPU 测试中 47 个跑完；12 个与 gold 逐位一致，22 个最多差 2/255，
+  13 个只在边缘像素有差异，3 个光追测试超时。所以跨实现的结果比较必须用容差。
+- Node 可以用 pip 装（PyPI 上的 `nodejs-wheel-binaries`）。
 
 尚未在真实 Colab 里测过的：需要登录才能执行的部分，即内核与浏览器之间的通道
 （`eval_js`、comm、端口代理）。`experiments/colab-probe/colab_probe.ipynb` 是为此准备的探针。
