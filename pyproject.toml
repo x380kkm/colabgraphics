@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "colabgraphics"
+version = "0.0.1"
+description = "Describe a rendering technique in a notebook, run it with WebGPU"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+images = ["pillow"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/colabgraphics"]
