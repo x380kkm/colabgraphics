@@ -32,10 +32,14 @@ const FLAGS = ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--use-angl
     const element = await f.frameElement();
     await element.scrollIntoViewIfNeeded().catch(() => {});
     await f.waitForFunction(() => self.colabgraphics[0].frames > 20 || self.colabgraphics[0].failed, null, { timeout: 45000 }).catch(() => {});
+    // Point at the picture, as a reader would, so the pixel readout has something to show.
+    await f.locator('canvas').hover({ position: { x: 120, y: 90 } }).catch(() => {});
+    await page.waitForTimeout(800);
     const state = await f.evaluate(() => {
       const h = self.colabgraphics[0];
+      const probe = document.querySelector('.cg-probe');
       return { name: h.program.name, failed: h.failed, frames: h.frames, status: document.querySelector('.cg-status').textContent,
-        controls: [...document.querySelectorAll('.cg-name')].map((e) => e.textContent) };
+        controls: [...document.querySelectorAll('.cg-name')].map((e) => e.textContent), probe: probe ? probe.textContent : null };
     });
     report.push(state);
     await page.screenshot({ path: `${shotPrefix}_${i + 1}_${state.name}.png` });
