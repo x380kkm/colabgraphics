@@ -63,6 +63,21 @@ VERTEX_STRUCT = """struct Vertex
     float3 color    : COLOR0;
 };"""
 
+# What fullscreen() puts in front of a pixel shader: the vertex shader nobody wants to write again.
+FULLSCREEN = """// One triangle that covers the whole target, so the pixel shader runs once per pixel.
+struct Fullscreen
+{
+    float4 position : SV_Position;  // in the pixel shader: the centre of the pixel, in pixels from the top left
+    float2 uv       : TEXCOORD0;    // (0, 0) at the top left corner, (1, 1) at the bottom right
+};
+Fullscreen FullscreenVS(uint id : SV_VertexID)
+{
+    Fullscreen o;
+    o.uv = float2((id << 1) & 2, id & 2);
+    o.position = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return o;
+}"""
+
 SYS_STRUCT = """struct Sys
 {
     float  time;        // seconds since the technique started
@@ -355,6 +370,9 @@ class Technique:
             self._owns(tex, name)
             if tex in (reads or {}).values():
                 raise TechniqueError(f'pass "{name}" both reads and draws into "{tex.name}"')
+            if tex.size != targets[0].size:
+                raise TechniqueError(f'pass "{name}": all targets must have the same size, but "{targets[0].name}" is '
+                                     f'{targets[0].size[0]} x {targets[0].size[1]} and "{tex.name}" is {tex.size[0]} x {tex.size[1]}')
         if depth is True:
             depth = self.texture(f"{name}_depth", like=targets[0], format="depth32float")
         elif depth:
@@ -366,6 +384,20 @@ class Technique:
             "targets": list(targets), "vertices": vertices, "instances": instances, "vertex": vertex,
             "pixel": pixel, "clear": clear, "depth": depth or None, "topology": topology, "cull": cull,
             "mesh": mesh}))
+
+    def fullscreen(self, name: str, code: str, targets: list[Texture], reads: dict | None = None,
+                   pixel: str = "PSMain") -> Pass:
+        """Run a pixel shader once for every pixel of `targets`: the usual way to write an image effect.
+
+        `code` is HLSL holding only the pixel shader; the system supplies the vertex shader,
+        one triangle that covers the whole target. The pixel shader can take
+        `float2 uv : TEXCOORD0`, which is (0, 0) at the top left corner and (1, 1) at the
+        bottom right, and `float4 position : SV_Position`, the centre of the pixel in
+        pixels. It can also take both as one `Fullscreen` struct, or no input at all.
+        """
+        p = self.draw(name, code, targets, reads=reads, vertices=3, vertex="FullscreenVS", pixel=pixel)
+        p.options["fullscreen"] = True
+        return p
 
     # ---- compile -------------------------------------------------------------
 
@@ -389,6 +421,8 @@ class Technique:
         slots["sys"] = {"kind": "sys"}
         if p.options.get("mesh"):
             lines.append(VERTEX_STRUCT)
+        if p.options.get("fullscreen"):
+            lines.append(FULLSCREEN)
 
         def connected(tex: Texture) -> str:
             return f'// texture "{tex.name}": {tex.size[0]} x {tex.size[1]}, {tex.format}'

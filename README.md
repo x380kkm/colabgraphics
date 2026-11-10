@@ -13,7 +13,7 @@
 
 | notebook | 内容 | |
 |---|---|---|
-| 第一步 | 三角形、变量、两个 pass 的模糊、用 numpy 核对 | [![在 Colab 中打开](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/x380kkm/colabgraphics/blob/dev/notebooks/01_first_steps.ipynb) |
+| 第一步 | 像素着色器、变量、三角形、两个 pass 的模糊、用 numpy 核对 | [![在 Colab 中打开](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/x380kkm/colabgraphics/blob/dev/notebooks/01_first_steps.ipynb) |
 | 第二步 | Blender 管场景和相机，自己的着色器渲染，与 Blender 的答案核对 | [![在 Colab 中打开](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/x380kkm/colabgraphics/blob/dev/notebooks/02_blender_scene.ipynb) |
 
 ![第一本 notebook 在未登录、未连接运行时的 Colab 里](docs/images/notebook_in_colab.jpg)
@@ -22,9 +22,26 @@
 
 ## 写起来是什么样
 
+最小的例子是一个像素着色器，系统对纹理的每个像素调用它一次：
+
 ```python
 import colabgraphics as cg
 
+t = cg.Technique("first")
+color = t.texture("color", size=(384, 384))
+t.var("speed", 2.0, min=-8.0, max=8.0)        # 画面旁边自动出现滑块
+t.fullscreen("shade", """
+float4 PSMain(float2 uv : TEXCOORD0) : SV_Target
+{
+    return float4(uv, 0.5 + 0.5 * sin(sys.time * vars.speed), 1);
+}
+""", targets=[color])
+t.show()                                      # 活的画面，存进 notebook
+```
+
+多个 pass 时，用 `reads=` 和 `writes=` 把着色器里的名字接到纹理上：
+
+```python
 BLUR = """
 [numthreads(8, 8, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID)
@@ -43,12 +60,12 @@ t = cg.Technique("boxblur")
 src = t.image("src", picture)                 # 一张 numpy 图片
 tmp = t.texture("tmp", like=src)              # 尺寸和格式跟随 src
 out = t.texture("out", like=src)
-t.var("radius", 6, min=0, max=32)             # 画面旁边自动出现滑块
+t.var("radius", 6, min=0, max=32)
 
 t.compute("blur_h", "static const int2 DIR = int2(1, 0);" + BLUR, reads={"image": src}, writes={"result": tmp})
 t.compute("blur_v", "static const int2 DIR = int2(0, 1);" + BLUR, reads={"image": tmp}, writes={"result": out})
 
-t.show()                # 活的画面，存进 notebook
+t.show()
 t.read(out, radius=4)   # 无头执行，返回 numpy 数组，用于断言
 ```
 
@@ -76,7 +93,9 @@ error[E30027]: member not found
 
 约定：
 
-- 入口函数默认叫 `CSMain`（compute pass）、`VSMain` 和 `PSMain`（draw pass），可以用 `entry=`、`vertex=`、`pixel=` 改。
+- 入口函数默认叫 `PSMain`（像素着色器）、`VSMain`（顶点着色器）、`CSMain`（compute 着色器），可以用 `pixel=`、`vertex=`、`entry=` 改。
+- `fullscreen()` 的像素着色器可以接收 `float2 uv : TEXCOORD0`（左上角 (0, 0)，右下角 (1, 1)）和
+  `float4 position : SV_Position`（像素中心，以像素计）。
 - `var()` 的类型跟随默认值：`int`、`float`、2 到 4 个数的元组（`float2` 到 `float4`）、4×4 的 numpy 数组（`float4x4`）。
   `bool` 在着色器里是取 0 或 1 的 `uint`。
 - 矩阵按数学上的习惯给：着色器里的 `mul(vars.m, v)` 等于 numpy 里的 `m @ v`。
@@ -87,7 +106,7 @@ error[E30027]: member not found
 
 | 部件 | 状态 |
 |---|---|
-| 技术描述与编译器（`technique.py`） | 纹理、变量、网格、compute pass、draw pass；为每个 pass 生成 HLSL 声明；绑定号、变量在常量缓冲里的偏移、线程组大小都取自编译器的反射数据 |
+| 技术描述与编译器（`technique.py`） | 纹理、变量、网格；三种 pass：`fullscreen`（只写像素着色器）、`draw`（光栅化）、`compute`；为每个 pass 生成 HLSL 声明；绑定号、变量在常量缓冲里的偏移、线程组大小都取自编译器的反射数据 |
 | 着色器编译（`slang.py`） | 在 Python 进程内通过 C 接口调用 Slang，HLSL 进、WGSL 出；报错指明 pass 和作者代码的行号，并作为 Python 异常抛出 |
 | 运行时（`js/runtime.js`） | 同一个文件在浏览器和 Node + Dawn 下运行 |
 | 查看器（`js/viewer.js`、`display.py`） | 自包含 HTML 输出；每个变量一个控件；pass 流程条，点纹理名看中间结果 |

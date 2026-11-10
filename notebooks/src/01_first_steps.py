@@ -1,5 +1,5 @@
 # %% [markdown]
-# # 第一步：三角形、变量、两个 pass
+# # 第一步：像素着色器、变量、三角形、两个 pass
 #
 # 这本 notebook 里的画面都是活的：它们随文件一起保存，打开时就在你的浏览器里用 WebGPU 渲染，
 # **不需要连接运行时**。想改代码再连。
@@ -16,50 +16,80 @@ import numpy as np
 import colabgraphics as cg
 
 # %% [markdown]
-# ## 一个三角形
+# ## 第一个着色器
 #
-# 一张纹理，一个 draw pass。顶点位置直接写在顶点着色器里，所以连顶点缓冲都不需要。
+# 像素着色器是一个函数：系统对画面上的每个像素调用它一次，它返回这个像素的颜色。
+# `fullscreen()` 的意思就是"对一张纹理的每个像素跑一遍这个函数"。
 #
-# `VSMain` 是顶点着色器，`PSMain` 是像素着色器。冒号后面的 `SV_Position`、`SV_Target` 叫语义，
-# 说明这个值的用途：裁剪空间位置、写进渲染目标的颜色。
+# 参数 `uv` 是像素在画面里的位置，左上角是 (0, 0)，右下角是 (1, 1)。冒号后面的 `TEXCOORD0`、`SV_Target` 叫语义，
+# 说明这个值从哪来、到哪去：`SV_Target` 表示返回值写进渲染目标。
+#
+# 把鼠标停在画面上可以读到那个像素的数值，可以拿来核对：红色分量是 `uv.x`，也就是（像素的横坐标 + 0.5）/ 384，
+# 绿色分量同理是纵坐标。
 
 # %%
-TRIANGLE = """
-struct VSOut
+first = cg.Technique("first")
+color = first.texture("color", size=(384, 384))
+first.fullscreen("shade", """
+float4 PSMain(float2 uv : TEXCOORD0) : SV_Target
 {
-    float4 position : SV_Position;
-    float3 color    : COLOR0;
-};
-
-VSOut VSMain(uint id : SV_VertexID)
-{
-    static const float2 corners[3] = { float2(0.0, 0.8), float2(-0.8, -0.8), float2(0.8, -0.8) };
-    static const float3 colors[3]  = { float3(1, 0.3, 0.2), float3(0.2, 1, 0.4), float3(0.3, 0.4, 1) };
-    VSOut o;
-    o.position = float4(corners[id], 0, 1);
-    o.color = colors[id];
-    return o;
+    return float4(uv, 0, 1);
 }
-
-float4 PSMain(VSOut input) : SV_Target
-{
-    return float4(input.color, 1);
-}
-"""
-
-tri = cg.Technique("triangle")
-color = tri.texture("color", size=(384, 384))
-tri.draw("tri", TRIANGLE, targets=[color], vertices=3)
-tri.show()
+""", targets=[color])
+first.show()
 
 # %% [markdown]
 # ## 变量
 #
 # `var()` 声明一个可以在运行时改动的值。着色器里用 `vars.名字` 读它，画面旁边会自动出现对应的控件。
-# 下面的 `sys.time` 是系统提供的时间（秒）。
+# 下面的 `sys.time` 是系统提供的时间（秒），所以画面会动。
 
 # %%
-SPIN = """
+RINGS = """
+float4 PSMain(float2 uv : TEXCOORD0) : SV_Target
+{
+    float2 p = uv * 2.0 - 1.0;                       // 把原点移到画面中心
+    float wave = cos(length(p) * vars.frequency - sys.time * vars.speed);
+    float3 background = float3(0.05, 0.05, 0.1);
+    return float4(lerp(background, vars.tint, 0.5 + 0.5 * wave), 1);
+}
+"""
+
+rings = cg.Technique("rings")
+color = rings.texture("color", size=(384, 384))
+rings.var("frequency", 24.0, min=1.0, max=80.0, doc="每单位长度的弧度数")
+rings.var("speed", 2.0, min=-8.0, max=8.0, doc="波向外走的速度，弧度每秒")
+rings.var("tint", (1.0, 0.8, 0.2), color=True)
+rings.fullscreen("shade", RINGS, targets=[color])
+rings.show()
+
+# %% [markdown]
+# ## 系统替你写了什么
+#
+# 着色器里用到的 `vars`、`sys` 都没有声明过，顶点着色器也没有写。编译时系统在你的代码前面补上了这些。
+# 这不是黑箱，随时可以看：
+
+# %%
+program = rings.compile()
+print(program.declarations("shade"))
+
+# %% [markdown]
+# 编译的结果也可以看。下面是上面那个像素着色器被翻译成的 WGSL，浏览器实际运行的就是它：
+
+# %%
+print(program.wgsl("shade", stage="pixel"))
+
+# %% [markdown]
+# ## 自己写顶点着色器：一个三角形
+#
+# `draw()` 画几何体，这时顶点着色器和像素着色器都由你写：`VSMain` 对每个顶点运行一次，给出它在画面上的位置
+# （`SV_Position`），`PSMain` 对三角形盖住的每个像素运行一次。顶点着色器的其他输出（这里是 `color`）
+# 会在三角形内部插值后交给像素着色器。
+#
+# 顶点位置直接写在着色器里，用顶点编号 `SV_VertexID` 去取，所以连顶点缓冲都不需要。
+
+# %%
+TRIANGLE = """
 struct VSOut
 {
     float4 position : SV_Position;
@@ -80,34 +110,16 @@ VSOut VSMain(uint id : SV_VertexID)
 
 float4 PSMain(VSOut input) : SV_Target
 {
-    return float4(lerp(input.color, vars.tint, vars.tint_amount), 1);
+    return float4(input.color, 1);
 }
 """
 
-spin = cg.Technique("spinning")
-color = spin.texture("color", size=(384, 384))
-spin.var("speed", 1.0, min=-4.0, max=4.0, doc="转速，弧度每秒")
-spin.var("scale", 0.8, min=0.1, max=1.2)
-spin.var("tint", (1.0, 0.8, 0.2), color=True)
-spin.var("tint_amount", 0.0, min=0.0, max=1.0)
-spin.draw("tri", SPIN, targets=[color], vertices=3)
-spin.show()
-
-# %% [markdown]
-# ## 系统替你写了什么
-#
-# 着色器里用到的 `vars`、`sys` 都没有声明过。编译时系统在你的代码前面补上了声明。
-# 这不是黑箱，随时可以看：
-
-# %%
-program = spin.compile()
-print(program.declarations("tri"))
-
-# %% [markdown]
-# 编译的结果也可以看。下面是上面那个像素着色器被翻译成的 WGSL，浏览器实际运行的就是它：
-
-# %%
-print(program.wgsl("tri", stage="pixel"))
+tri = cg.Technique("triangle")
+color = tri.texture("color", size=(384, 384))
+tri.var("speed", 1.0, min=-4.0, max=4.0, doc="转速，弧度每秒")
+tri.var("scale", 0.8, min=0.1, max=1.2)
+tri.draw("tri", TRIANGLE, targets=[color], vertices=3)
+tri.show()
 
 # %% [markdown]
 # ## 两个 pass：可分离的 box blur

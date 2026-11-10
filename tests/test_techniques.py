@@ -246,6 +246,34 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     assert np.allclose(z, 0.25), (z.min(), z.max())
 
 
+def test_fullscreen_runs_a_pixel_shader_on_every_pixel():
+    ys, xs = np.mgrid[0:8, 0:16]
+    shaders = {
+        "separate inputs": "float4 PSMain(float2 uv : TEXCOORD0, float4 position : SV_Position) : SV_Target"
+                           " { return float4(uv, position.xy); }",
+        "the struct": "float4 PSMain(Fullscreen input) : SV_Target { return float4(input.uv, input.position.xy); }",
+    }
+    for how, code in shaders.items():
+        t = cg.Technique("fullscreen")
+        out = t.texture("out", size=(16, 8), format="rgba32float")
+        t.fullscreen("gradient", code, targets=[out])
+        got = t.read(out)
+        assert np.allclose(got[..., 0], (xs + 0.5) / 16, atol=1e-4), how      # uv: (0, 0) is the top left corner
+        assert np.allclose(got[..., 1], (ys + 0.5) / 8, atol=1e-4), how
+        assert np.allclose(got[..., 2], xs + 0.5) and np.allclose(got[..., 3], ys + 0.5), how   # pixel centres
+
+    # No inputs at all, variables and sys, in the browser.
+    t = cg.Technique("fullscreen")
+    out = t.texture("out", size=(16, 8))
+    t.var("level", 0.5)
+    t.fullscreen("flat", "float4 PSMain() : SV_Target { return float4(vars.level, sys.resolution / 255.0, 1); }", targets=[out])
+    _, got = run_in_browser(t, "out", "level=1.0")
+    assert (got == [255, 16, 8, 255]).all(), got[0, 0]
+
+    a = t.texture("a", size=(4, 4))
+    expect_error(lambda: t.fullscreen("two", "float4 PSMain() : SV_Target { return 0; }", targets=[out, a]), "same size")
+
+
 def test_a_texture_can_accumulate_over_frames():
     """r32float is one of the two formats WebGPU lets a pass read and write in place."""
     t = cg.Technique("count")
