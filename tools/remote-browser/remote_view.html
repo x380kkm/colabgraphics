@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Remote browser</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f4f4f5; --fg: #18181b; --muted: #71717a; --line: #d4d4d8; --accent: #2563eb; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #18181b; --fg: #f4f4f5; --muted: #a1a1aa; --line: #3f3f46; --accent: #60a5fa; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+  header .title { font-weight: 600; }
+  header .status { color: var(--muted); flex: 1; min-width: 12ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  input, button { font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: inherit; }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: white; }
+  #gate { max-width: 420px; margin: 12vh auto; padding: 0 16px; }
+  #gate p { color: var(--muted); }
+  #gate form { display: flex; gap: 8px; }
+  #gate input { flex: 1; }
+  #view { display: none; }
+  #screen { display: block; width: 100%; height: auto; outline: none; cursor: default; touch-action: none; background: #000; }
+  #screen:focus { box-shadow: inset 0 0 0 2px var(--accent); }
+  .typebar { display: flex; gap: 8px; padding: 8px 12px; border-top: 1px solid var(--line); align-items: center; flex-wrap: wrap; }
+  .typebar input[type="text"], .typebar input[type="password"] { flex: 1; min-width: 16ch; }
+  .hint { color: var(--muted); padding: 0 12px 10px; }
+</style>
+</head>
+<body>
+<div id="gate">
+  <h2>远程浏览器</h2>
+  <p>这是云端容器里的一个普通浏览器的画面。输入对话里给出的访问码后，你可以直接用鼠标和键盘操作它。</p>
+  <form id="gate-form">
+    <input id="code" type="password" autocomplete="off" placeholder="访问码" autofocus>
+    <button class="primary" type="submit">进入</button>
+  </form>
+  <p id="gate-error" role="alert"></p>
+</div>
+
+<div id="view">
+  <header>
+    <span class="title">远程浏览器</span>
+    <span class="status" id="status">连接中…</span>
+    <button id="reload" type="button" title="向远程浏览器发送 F5">刷新远程页面</button>
+  </header>
+  <canvas id="screen" tabindex="0" width="1280" height="800"></canvas>
+  <div class="typebar">
+    <input id="typed" type="password" autocomplete="off" placeholder="在这里输入或粘贴文字，回车发送到远程浏览器的当前输入框">
+    <label><input id="show" type="checkbox"> 显示</label>
+    <button id="send" type="button">发送</button>
+    <button id="enter" type="button" title="向远程浏览器发送回车键">回车</button>
+  </div>
+  <div class="hint">点一下画面后可以直接用键盘。密码这类内容建议用下面的输入框粘贴发送：默认不回显。</div>
+</div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  let code = sessionStorage.getItem('remote-view-code') || '';
+  const canvas = $('screen'), ctx = canvas.getContext('2d');
+  let version = -1, queue = [], flushing = false, lastMove = 0;
+
+  const headers = () => ({ 'X-Access-Code': code });
+
+  async function frames() {
+    for (;;) {
+      try {
+        const r = await fetch('frame?v=' + version, { headers: headers(), cache: 'no-store' });
+        if (r.status === 403) { sessionStorage.removeItem('remote-view-code'); location.reload(); return; }
+        if (r.status === 200) {
+          version = parseInt(r.headers.get('X-Frame-Version') || '0', 10);
+          const bitmap = await createImageBitmap(await r.blob());
+          if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) { canvas.width = bitmap.width; canvas.height = bitmap.height; }
+          ctx.drawImage(bitmap, 0, 0);
+          bitmap.close();
+        }
+      } catch (e) {
+        $('status').textContent = '连接中断，正在重试…';
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+  }
+
+  async function status() {
+    for (;;) {
+      try {
+        const r = await fetch('status', { headers: headers(), cache: 'no-store' });
+        if (r.ok) { const s = await r.json(); $('status').textContent = s.title || '（没有活动窗口）'; }
+      } catch (e) { /* frames() reports connection trouble */ }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+
+  async function flush() {
+    if (flushing || !queue.length) return;
+    flushing = true;
+    const batch = queue; queue = [];
+    try { await fetch('input', { method: 'POST', headers: headers(), body: JSON.stringify(batch) }); } catch (e) { /* dropped */ }
+    flushing = false;
+    if (queue.length) flush();
+  }
+  const send = (event) => { queue.push(event); flush(); };
+
+  const point = (e) => {
+    const r = canvas.getBoundingClientRect();
+    return { x: Math.round((e.clientX - r.left) * canvas.width / r.width), y: Math.round((e.clientY - r.top) * canvas.height / r.height) };
+  };
+  const button = (e) => ({ 0: 1, 1: 2, 2: 3 }[e.button] || 1);
+  canvas.addEventListener('pointerdown', (e) => { canvas.focus(); canvas.setPointerCapture(e.pointerId); send({ t: 'down', b: button(e), ...point(e) }); e.preventDefault(); });
+  canvas.addEventListener('pointerup', (e) => { send({ t: 'up', b: button(e), ...point(e) }); e.preventDefault(); });
+  canvas.addEventListener('pointermove', (e) => {
+    const now = performance.now();
+    if (now - lastMove < 60) return;
+    lastMove = now;
+    send({ t: 'move', ...point(e) });
+  });
+  canvas.addEventListener('wheel', (e) => { send({ t: 'wheel', dy: e.deltaY, ...point(e) }); e.preventDefault(); }, { passive: false });
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  const NAMED = { Enter: 'Return', Backspace: 'BackSpace', Tab: 'Tab', Escape: 'Escape', Delete: 'Delete', ' ': 'space',
+    ArrowLeft: 'Left', ArrowRight: 'Right', ArrowUp: 'Up', ArrowDown: 'Down', Home: 'Home', End: 'End', PageUp: 'Prior', PageDown: 'Next',
+    '-': 'minus', '=': 'equal', '.': 'period', ',': 'comma', '/': 'slash', ';': 'semicolon', "'": 'apostrophe', '[': 'bracketleft', ']': 'bracketright', '\\': 'backslash', '`': 'grave' };
+  canvas.addEventListener('keydown', (e) => {
+    if (e.isComposing || ['Shift', 'Control', 'Alt', 'Meta', 'CapsLock'].includes(e.key)) return;
+    const modified = e.ctrlKey || e.altKey || e.metaKey;
+    if (e.key.length === 1 && !modified) { send({ t: 'text', s: e.key }); e.preventDefault(); return; }
+    let name = NAMED[e.key] || (/^F\d{1,2}$/.test(e.key) ? e.key : null) || (e.key.length === 1 && /[a-z0-9]/i.test(e.key) ? e.key.toLowerCase() : null);
+    if (!name) return;
+    const combo = (e.ctrlKey ? 'ctrl+' : '') + (e.altKey ? 'alt+' : '') + (e.shiftKey && (modified || e.key.length > 1) ? 'shift+' : '') + (e.metaKey ? 'super+' : '') + name;
+    send({ t: 'key', k: combo });
+    e.preventDefault();
+  });
+
+  const typed = $('typed');
+  const sendTyped = () => { if (typed.value) { send({ t: 'text', s: typed.value }); typed.value = ''; } };
+  $('send').addEventListener('click', sendTyped);
+  typed.addEventListener('keydown', (e) => { if (e.key === 'Enter') { sendTyped(); e.preventDefault(); } });
+  $('show').addEventListener('change', (e) => { typed.type = e.target.checked ? 'text' : 'password'; });
+  $('enter').addEventListener('click', () => send({ t: 'key', k: 'Return' }));
+  $('reload').addEventListener('click', () => send({ t: 'key', k: 'F5' }));
+
+  async function enter(candidate) {
+    const r = await fetch('status', { headers: { 'X-Access-Code': candidate }, cache: 'no-store' }).catch(() => null);
+    if (!r || !r.ok) return false;
+    code = candidate;
+    sessionStorage.setItem('remote-view-code', code);
+    $('gate').style.display = 'none';
+    $('view').style.display = 'block';
+    frames(); status();
+    return true;
+  }
+  $('gate-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!(await enter($('code').value.trim()))) $('gate-error').textContent = '访问码不对，或者服务还没启动。';
+  });
+  if (code) enter(code);
+})();
+</script>
+</body>
+</html>
