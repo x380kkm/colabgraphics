@@ -12,7 +12,8 @@ technique can use, and asks Blender for answers to check a renderer against.
 
 Conventions. Blender's world is right-handed with Z up. A camera looks along its local
 -Z with +Y up. Matrices are returned in the usual maths layout (they multiply column
-vectors); `Technique.var` converts them for WGSL. The projection maps depth to 0..1,
+vectors), which is how `Technique.var` takes them: in a shader, write
+`mul(vars.view_projection, float4(position, 1))`. The projection maps depth to 0..1,
 which is what WebGPU expects, not the -1..1 of OpenGL that Blender itself produces.
 Images and reference arrays have row 0 at the top.
 """

@@ -39,38 +39,54 @@ print("太阳照射方向", sun.direction.round(2))
 # %% [markdown]
 # ## 用自己的着色器画它
 #
-# 网格交给 `mesh()`，相机矩阵交给 `var()`。顶点着色器里的 `Vertex` 结构体由系统声明。
-# 一个 pass 同时写三张纹理：着色结果、法线、离相机的距离。点画面下方的纹理名可以分别看；
-# 鼠标停在画面上会显示该像素的数值，比如在 `view_depth` 上读到的就是以场景单位计的距离。
+# 网格交给 `mesh()`，相机矩阵交给 `var()`。顶点着色器里的 `Vertex` 结构体由系统声明
+# （`position`、`normal`、`uv`、`color`）。矩阵按数学上的习惯给：着色器里的 `mul(矩阵, 列向量)`
+# 等于 numpy 里的 `矩阵 @ 向量`。
+#
+# 一个 pass 同时写三张纹理（`SV_Target0` 到 `SV_Target2`）：着色结果、法线、离相机的距离。
+# 点画面下方的纹理名可以分别看；鼠标停在画面上会显示该像素的数值，比如在 `view_depth` 上读到的就是以场景单位计的距离。
 #
 # 太阳的方位和高度做成了变量，初始值取自 Blender 里那盏灯。拖一拖看看。
 
 # %%
 SHADER = """
-struct Varying {
-  @builtin(position) clip: vec4f,
-  @location(0) world: vec3f,
-  @location(1) normal: vec3f,
-  @location(2) color: vec3f,
-}
-struct Targets {
-  @location(0) color: vec4f,
-  @location(1) normal: vec4f,
-  @location(2) depth: vec4f,
+struct VSOut
+{
+    float4 position : SV_Position;
+    float3 world    : TEXCOORD0;
+    float3 normal   : NORMAL;
+    float3 color    : COLOR0;
+};
+
+struct PSOut
+{
+    float4 color  : SV_Target0;
+    float4 normal : SV_Target1;
+    float  depth  : SV_Target2;
+};
+
+VSOut VSMain(Vertex v)
+{
+    VSOut o;
+    o.position = mul(vars.view_projection, float4(v.position, 1));
+    o.world = v.position;
+    o.normal = v.normal;
+    o.color = v.color;
+    return o;
 }
 
-@vertex fn vs(v: Vertex) -> Varying {
-  return Varying(vars.view_projection * vec4f(v.position, 1), v.position, v.normal, v.color);
-}
-
-@fragment fn fs(in: Varying) -> Targets {
-  let n = normalize(in.normal);
-  let to_sun = vec3f(cos(vars.sun_elevation) * cos(vars.sun_azimuth),
-                     cos(vars.sun_elevation) * sin(vars.sun_azimuth),
-                     sin(vars.sun_elevation));
-  let lit = in.color * (vars.ambient + (1.0 - vars.ambient) * max(dot(n, to_sun), 0.0));
-  let view_depth = -(vars.view * vec4f(in.world, 1)).z;   // 相机前方的距离
-  return Targets(vec4f(pow(lit, vec3f(1.0 / 2.2)), 1), vec4f(n * 0.5 + 0.5, 1), vec4f(view_depth, 0, 0, 1));
+PSOut PSMain(VSOut input)
+{
+    float3 n = normalize(input.normal);
+    float3 to_sun = float3(cos(vars.sun_elevation) * cos(vars.sun_azimuth),
+                           cos(vars.sun_elevation) * sin(vars.sun_azimuth),
+                           sin(vars.sun_elevation));
+    float3 lit = input.color * (vars.ambient + (1.0 - vars.ambient) * max(dot(n, to_sun), 0.0));
+    PSOut o;
+    o.color = float4(pow(lit, 1.0 / 2.2), 1);
+    o.normal = float4(n * 0.5 + 0.5, 1);
+    o.depth = -mul(vars.view, float4(input.world, 1)).z;   // 相机前方的距离
+    return o;
 }
 """
 

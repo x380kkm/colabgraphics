@@ -113,13 +113,11 @@ def run(program, read: list[str] | None = None, frames: int = 1, vars: dict | No
             raise HeadlessError("the headless runner produced no result:\n" + (done.stderr or done.stdout)[-1200:])
         result = json.loads(line[len("RESULT "):])
         if not result["ok"]:
-            details = []
-            for m in result.get("shaderErrors", []):
-                p = next(p for p in program.json["passes"] if p["name"] == m["pass"])
-                line_no = m["line"] - p["preambleLines"]
-                where = f"line {line_no}" if line_no > 0 else "generated declarations"
-                details.append(f'pass "{m["pass"]}", {where}: {m["message"]}')
-            if not details:  # validation text only repeats a shader error, with whole-shader line numbers
+            # The HLSL compiled, so what is reported here is Dawn refusing the compiled WGSL.
+            details = [f'pass "{m["pass"]}": the compiled {"pixel" if m["stage"] == "fragment" else m["stage"]} shader '
+                       f'was rejected.\n  {m["message"]}\n  WGSL line {m["line"]}: {m["text"]}'
+                       for m in result.get("shaderErrors", [])]
+            if not details:  # validation text only repeats a shader error
                 details += result.get("validation", [])
             raise HeadlessError("\n".join(details) or result.get("error", "unknown failure"))
         arrays = {}

@@ -6,10 +6,10 @@
 // A program is plain JSON produced by the Python compiler:
 //   textures  [{ name, format, size:[w,h], data? }]      data = deflate-compressed pixels, base64
 //   vars      { size, fields:[{ name, type, offset, value, ... }] }
-//   passes    [{ kind:'compute'|'draw', name, code, bindings:[...], ... }]
+//   passes    [{ kind:'compute'|'draw', name, stages:{ compute | vertex, fragment: { entry, code } }, bindings:[...], ... }]
 //   view      name of the texture shown by default
-// The WGSL in `code` is complete: the compiler has already prepended the declarations
-// for every resource the author's code refers to.
+// The author wrote HLSL; each stage's `code` is the WGSL the Slang compiler made of it,
+// one module per entry point. `bindings` says what goes in each binding slot.
 
 export const FORMATS = {
   // format: [bytes per pixel, sample type when bound as a texture, array type for read-back]
@@ -129,11 +129,13 @@ export class Runtime {
       let resource;
       if (b.kind === 'texture') {
         const { texture, desc } = this.textures.get(b.texture);
-        entry.texture = { sampleType: FORMATS[desc.format][1], viewDimension: '2d' };
+        // Compiled shaders declare a depth texture as an ordinary float texture.
+        const sampleType = FORMATS[desc.format][1];
+        entry.texture = { sampleType: sampleType === 'depth' ? 'unfilterable-float' : sampleType, viewDimension: '2d' };
         resource = texture.createView();
       } else if (b.kind === 'storage') {
         const { texture, desc } = this.textures.get(b.texture);
-        entry.storageTexture = { access: 'write-only', format: desc.format, viewDimension: '2d' };
+        entry.storageTexture = { access: b.access || 'write-only', format: desc.format, viewDimension: '2d' };
         resource = texture.createView();
       } else if (b.kind === 'sampler') {
         entry.sampler = { type: b.filter === 'linear' ? 'filtering' : 'non-filtering' };
@@ -152,11 +154,14 @@ export class Runtime {
     }
     const bindGroupLayout = device.createBindGroupLayout({ label: pass.name, entries: layoutEntries });
     const layout = device.createPipelineLayout({ label: pass.name, bindGroupLayouts: [bindGroupLayout] });
-    const module = device.createShaderModule({ label: pass.name, code: pass.code });
-    const built = { pass, sysBuffer, module, resolution: [1, 1] };
+    const modules = {};
+    for (const [name, s] of Object.entries(pass.stages)) {
+      modules[name] = { module: device.createShaderModule({ label: `${pass.name}.${name}`, code: s.code }), entryPoint: s.entry };
+    }
+    const built = { pass, sysBuffer, modules, resolution: [1, 1] };
 
     if (pass.kind === 'compute') {
-      built.pipeline = device.createComputePipeline({ label: pass.name, layout, compute: { module, entryPoint: pass.entry } });
+      built.pipeline = device.createComputePipeline({ label: pass.name, layout, compute: modules.compute });
       const size = this.textures.get(pass.dispatch.texture).desc.size;
       built.resolution = size;
       built.groups = pass.dispatch.workgroup.map((w, i) => Math.ceil((size[i] ?? 1) / w));
@@ -165,8 +170,8 @@ export class Runtime {
       built.resolution = this.textures.get(pass.targets[0].texture).desc.size;
       const descriptor = {
         label: pass.name, layout,
-        vertex: { module, entryPoint: pass.vertex },
-        fragment: { module, entryPoint: pass.fragment, targets },
+        vertex: { ...modules.vertex },
+        fragment: { ...modules.fragment, targets },
         primitive: { topology: pass.topology, cullMode: pass.cull },
       };
       if (pass.mesh) descriptor.vertex.buffers = [VERTEX_LAYOUT];
@@ -177,12 +182,19 @@ export class Runtime {
     return built;
   }
 
-  /** Per-module compile messages (errors and warnings), with line numbers in the complete WGSL. */
+  /** Per-module compile messages (errors and warnings). Line numbers refer to the compiled WGSL;
+   *  `text` is that line. Mistakes in the author's HLSL are caught earlier, by the compiler in Python. */
   async shaderMessages() {
     const out = [];
     for (const built of this.passes) {
-      const info = await built.module.getCompilationInfo();
-      for (const m of info.messages) out.push({ pass: built.pass.name, type: m.type, line: m.lineNum, column: m.linePos, message: m.message });
+      for (const [stage, { module }] of Object.entries(built.modules)) {
+        const info = await module.getCompilationInfo();
+        const lines = built.pass.stages[stage].code.split('\n');
+        for (const m of info.messages) {
+          out.push({ pass: built.pass.name, stage, type: m.type, line: m.lineNum, column: m.linePos, message: m.message,
+            text: (lines[m.lineNum - 1] || '').trim() });
+        }
+      }
     }
     return out;
   }

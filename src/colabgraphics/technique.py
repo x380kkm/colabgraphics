@@ -1,18 +1,20 @@
 """Describe a rendering technique and compile it into a program for the runtime.
 
 A technique is a list of resources (textures), variables and passes. The author writes
-only the algorithmic part of each shader; `compile()` works out everything else:
+each pass's shader in HLSL, and only its algorithmic part; `compile()` works out the rest:
 
-- the WGSL declarations for each resource a shader refers to by name,
-- one uniform struct, `vars`, holding the technique's variables,
-- which GPU usages every texture needs, and how many workgroups a compute pass dispatches.
+- the HLSL declarations for every resource the shader can refer to by name, and one
+  constant buffer, `vars`, holding the technique's variables,
+- the translation of each entry point to WGSL, the language WebGPU runs, done by the
+  Slang compiler (see slang.py),
+- from the compiler's reflection data: which binding each resource got, where each
+  variable sits in the constant buffer, and how many threads a compute group has.
 
 The result is plain JSON that `js/runtime.js` executes, in a browser or headless.
 """
 from __future__ import annotations
 
 import base64
-import math
 import re
 import zlib
 from dataclasses import dataclass, field
@@ -20,54 +22,76 @@ from typing import Any
 
 import numpy as np
 
-# format -> (bytes per pixel, WGSL texture type when read, usable as compute output)
+from . import slang
+
+# format -> (bytes per pixel, HLSL type of one texel, usable as compute output)
 FORMATS = {
-    "r8unorm": (1, "texture_2d<f32>", False),
-    "rg8unorm": (2, "texture_2d<f32>", False),
-    "rgba8unorm": (4, "texture_2d<f32>", True),
-    "rgba8unorm-srgb": (4, "texture_2d<f32>", False),
-    "rgba8snorm": (4, "texture_2d<f32>", True),
-    "rgba16float": (8, "texture_2d<f32>", True),
-    "r32float": (4, "texture_2d<f32>", True),
-    "rg32float": (8, "texture_2d<f32>", True),
-    "rgba32float": (16, "texture_2d<f32>", True),
-    "r32uint": (4, "texture_2d<u32>", True),
-    "rgba8uint": (4, "texture_2d<u32>", True),
-    "depth32float": (4, "texture_depth_2d", False),
+    "r8unorm": (1, "float", False),
+    "rg8unorm": (2, "float2", False),
+    "rgba8unorm": (4, "float4", True),
+    "rgba8unorm-srgb": (4, "float4", False),
+    "rgba8snorm": (4, "float4", True),
+    "rgba16float": (8, "float4", True),
+    "r32float": (4, "float", True),
+    "rg32float": (8, "float2", True),
+    "rgba32float": (16, "float4", True),
+    "r32uint": (4, "uint", True),
+    "rgba8uint": (4, "uint4", True),
+    "depth32float": (4, "float", False),
 }
 
-# WGSL type -> (scalar, component count, alignment, size) under uniform layout rules
+# The only formats WebGPU lets a shader read and write through one binding.
+READ_WRITE_FORMATS = ("r32float", "r32uint")
+
+# HLSL type of a variable -> (scalar the runtime writes, number of scalars)
 VAR_TYPES = {
-    "f32": ("f32", 1, 4, 4),
-    "i32": ("i32", 1, 4, 4),
-    "u32": ("u32", 1, 4, 4),
-    "vec2f": ("f32", 2, 8, 8),
-    "vec3f": ("f32", 3, 16, 12),
-    "vec4f": ("f32", 4, 16, 16),
-    "mat4x4f": ("f32", 16, 16, 64),
+    "float": ("f32", 1),
+    "int": ("i32", 1),
+    "uint": ("u32", 1),
+    "float2": ("f32", 2),
+    "float3": ("f32", 3),
+    "float4": ("f32", 4),
+    "float4x4": ("f32", 16),
 }
 
 # Every mesh uses this vertex layout: 44 bytes per vertex.
-VERTEX_STRUCT = """struct Vertex {
-  @location(0) position: vec3f,
-  @location(1) normal: vec3f,
-  @location(2) uv: vec2f,
-  @location(3) color: vec3f,
-}"""
+VERTEX_STRUCT = """struct Vertex
+{
+    float3 position : POSITION;
+    float3 normal   : NORMAL;
+    float2 uv       : TEXCOORD0;
+    float3 color    : COLOR0;
+};"""
 
-SYS_STRUCT = """struct Sys {
-  time: f32,          // seconds since the technique started
-  frame: u32,         // frames rendered so far
-  resolution: vec2f,  // size in pixels of what this pass writes to
-  mouse: vec4f,       // xy: pointer position in pixels, z: 1 while pressed
-}"""
+SYS_STRUCT = """struct Sys
+{
+    float  time;        // seconds since the technique started
+    uint   frame;       // frames rendered so far
+    float2 resolution;  // size in pixels of what this pass writes to
+    float4 mouse;       // xy: pointer position in pixels, z: 1 while pressed
+};"""
 
 RESERVED = {"vars", "sys", "linear_sampler", "nearest_sampler"}
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+DECLARED = "declared for you"   # the name the generated declarations carry in compiler messages
+
+# What only a pixel shader can do (it needs screen-space derivatives), as it appears in the
+# compiled WGSL, and the HLSL spelling to name in the message.
+PIXEL_ONLY = {"textureSample": "Sample", "textureSampleBias": "SampleBias", "textureSampleCompare": "SampleCmp",
+              "dpdx": "ddx", "dpdy": "ddy", "fwidth": "fwidth"}
 
 
 class TechniqueError(Exception):
     """The technique description is inconsistent. The message says what and where."""
+
+
+class ShaderError(TechniqueError):
+    """A pass's shader does not compile. The message is the compiler's report, which names
+    the pass and the line, counted from the start of that pass's code."""
+
+    def __init__(self, pass_name: str, diagnostics: str, message: str | None = None):
+        self.pass_name, self.diagnostics = pass_name, diagnostics
+        super().__init__(message or f'pass "{pass_name}": the shader does not compile.\n\n{diagnostics}')
 
 
 @dataclass(eq=False)
@@ -113,15 +137,6 @@ class Pass:
     code: str
     reads: dict[str, Texture]
     options: dict[str, Any] = field(default_factory=dict)
-
-
-def _strip_comments(code: str) -> str:
-    code = re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group(0).count("\n"), code, flags=re.S)
-    return re.sub(r"//[^\n]*", "", code)
-
-
-def _uses(code: str, name: str) -> bool:
-    return re.search(rf"(?<![A-Za-z0-9_.]){re.escape(name)}(?![A-Za-z0-9_])", code) is not None
 
 
 def _pack(pixels: np.ndarray) -> str:
@@ -248,15 +263,16 @@ class Technique:
     def var(self, name: str, value, min=None, max=None, step=None, doc: str = "", color: bool = False) -> Var:
         """A value the reader can change while the technique runs. Shaders read it as vars.<name>.
 
-        A 4x4 numpy array becomes a mat4x4f (given in the usual maths layout, where the
-        matrix multiplies a column vector); it gets no control in the viewer.
+        The HLSL type follows the default: int, float, a tuple of 2 to 4 numbers (float2 to
+        float4), or bool, which becomes a uint holding 0 or 1. A 4x4 numpy array becomes a
+        float4x4 and gets no control in the viewer; give it in the usual maths layout, so
+        that `mul(vars.m, float4(p, 1))` in the shader equals `m @ [x, y, z, 1]` in numpy.
         """
         self._check_name(name, "variable")
         if any(v.name == name for v in self.vars):
             raise TechniqueError(f'there is already a variable named "{name}"')
         if isinstance(value, np.ndarray) and value.shape == (4, 4):
-            # WGSL stores matrices column by column.
-            var = Var(name, "mat4x4f", [float(x) for x in value.T.reshape(-1)], ui="hidden", doc=doc)
+            var = Var(name, "float4x4", _matrix(value), ui="hidden", doc=doc)
             self.vars.append(var)
             return var
         if isinstance(value, np.ndarray) and value.ndim == 1:
@@ -264,17 +280,18 @@ class Technique:
         elif isinstance(value, np.generic):
             value = value.item()
         if isinstance(value, bool):
-            wgsl, ui = "u32", "checkbox"
+            hlsl, ui = "uint", "checkbox"
         elif isinstance(value, int):
-            wgsl, ui = "i32", "slider" if min is not None and max is not None else "number"
+            hlsl, ui = "int", "slider" if min is not None and max is not None else "number"
         elif isinstance(value, float):
-            wgsl, ui = "f32", "slider" if min is not None and max is not None else "number"
+            hlsl, ui = "float", "slider" if min is not None and max is not None else "number"
         elif isinstance(value, (tuple, list)) and len(value) in (2, 3, 4):
-            wgsl, ui = f"vec{len(value)}f", "color" if color else "number"
+            hlsl, ui = f"float{len(value)}", "color" if color else "number"
             value = [float(x) for x in value]
         else:
-            raise TechniqueError(f'variable "{name}": the default must be a bool, int, float or a tuple of 2 to 4 numbers')
-        var = Var(name, wgsl, value, min, max, step, ui, doc)
+            raise TechniqueError(f'variable "{name}": the default must be a bool, int, float, '
+                                 f"a tuple of 2 to 4 numbers or a 4x4 array")
+        var = Var(name, hlsl, value, min, max, step, ui, doc)
         self.vars.append(var)
         return var
 
@@ -283,9 +300,11 @@ class Technique:
     def _add_pass(self, p: Pass) -> Pass:
         if any(q.name == p.name for q in self.passes):
             raise TechniqueError(f'there is already a pass named "{p.name}"')
-        for wgsl_name, tex in p.reads.items():
-            self._check_name(wgsl_name, f'pass "{p.name}": resource')
+        for hlsl_name, tex in p.reads.items():
+            self._check_name(hlsl_name, f'pass "{p.name}": resource')
             self._owns(tex, p.name)
+            if hlsl_name in p.options.get("writes", {}):
+                raise TechniqueError(f'pass "{p.name}": the name "{hlsl_name}" is used for a texture it reads and for one it writes')
         self.passes.append(p)
         return p
 
@@ -293,12 +312,17 @@ class Technique:
         if not isinstance(tex, Texture) or tex not in self.textures:
             raise TechniqueError(f'pass "{pass_name}": {tex!r} is not a texture of this technique')
 
-    def compute(self, name: str, code: str, entry: str = "main", reads: dict | None = None,
+    def compute(self, name: str, code: str, entry: str = "CSMain", reads: dict | None = None,
                 writes: dict | None = None, over: Texture | None = None) -> Pass:
-        """Run a compute shader once per pixel of `over` (by default, the first texture it writes)."""
+        """Run a compute shader once per pixel of `over` (by default, the first texture it writes).
+
+        `code` is HLSL. `reads` and `writes` connect names used in the shader to textures:
+        a name in `reads` is a Texture2D, a name in `writes` is a RWTexture2D. `entry` is
+        the function to run.
+        """
         reads, writes = dict(reads or {}), dict(writes or {})
-        for wgsl_name, tex in writes.items():
-            self._check_name(wgsl_name, f'pass "{name}": resource')
+        for hlsl_name, tex in writes.items():
+            self._check_name(hlsl_name, f'pass "{name}": resource')
             self._owns(tex, name)
             if not FORMATS[tex.format][2]:
                 raise TechniqueError(f'pass "{name}": a compute shader cannot write to "{tex.name}" '
@@ -313,14 +337,15 @@ class Technique:
         return self._add_pass(Pass("compute", name, code, reads, {"entry": entry, "writes": writes, "over": over}))
 
     def draw(self, name: str, code: str, targets: list[Texture], reads: dict | None = None,
-             vertices: int = 3, instances: int = 1, vertex: str = "vs", fragment: str = "fs",
+             vertices: int = 3, instances: int = 1, vertex: str = "VSMain", pixel: str = "PSMain",
              clear: tuple | None = (0, 0, 0, 1), depth: Texture | bool | None = None,
              topology: str = "triangle-list", cull: str = "none", mesh: Mesh | None = None) -> Pass:
-        """Rasterize into `targets`.
+        """Rasterize into `targets`: SV_Target0 goes to the first, SV_Target1 to the second, and so on.
 
-        With `mesh=`, the vertex shader receives that mesh's vertices as a `Vertex` struct.
-        Without it, `vertices` vertices are drawn and the vertex shader makes up the geometry
-        from the vertex index.
+        `code` is HLSL holding both the vertex shader and the pixel shader; `vertex` and
+        `pixel` name the two functions. With `mesh=`, the vertex shader receives that mesh's
+        vertices as a `Vertex` struct. Without it, `vertices` vertices are drawn and the
+        vertex shader makes up the geometry from SV_VertexID.
         """
         if not targets:
             raise TechniqueError(f'pass "{name}": give at least one texture in targets=[...]')
@@ -339,111 +364,154 @@ class Technique:
         self.view = targets[0]
         return self._add_pass(Pass("draw", name, code, dict(reads or {}), {
             "targets": list(targets), "vertices": vertices, "instances": instances, "vertex": vertex,
-            "fragment": fragment, "clear": clear, "depth": depth or None, "topology": topology, "cull": cull,
+            "pixel": pixel, "clear": clear, "depth": depth or None, "topology": topology, "cull": cull,
             "mesh": mesh}))
 
     # ---- compile -------------------------------------------------------------
 
-    def _layout_vars(self):
-        fields, offset, largest = [], 0, 4
+    def _declarations(self, p: Pass):
+        """The HLSL placed in front of this pass's code, and what each declared name stands for.
+
+        Everything the pass may use is declared; the compiler drops what the shader never
+        touches and reports which names it did use.
+        """
+        lines = [f'// ---- declared for you: pass "{p.name}" ----']
+        slots: dict[str, dict] = {}
+        if self.vars:
+            width = max(len(v.type) for v in self.vars)
+            lines += ["struct Vars", "{"]
+            for v in self.vars:
+                doc = " ".join(v.doc.split())
+                lines.append(f"    {v.type:<{width}} {v.name};" + (f"  // {doc}" if doc else ""))
+            lines += ["};", "ConstantBuffer<Vars> vars;"]
+            slots["vars"] = {"kind": "vars"}
+        lines += [SYS_STRUCT, "ConstantBuffer<Sys> sys;"]
+        slots["sys"] = {"kind": "sys"}
+        if p.options.get("mesh"):
+            lines.append(VERTEX_STRUCT)
+
+        def connected(tex: Texture) -> str:
+            return f'// texture "{tex.name}": {tex.size[0]} x {tex.size[1]}, {tex.format}'
+
+        for name, tex in p.reads.items():
+            lines.append(f"Texture2D<{FORMATS[tex.format][1]}> {name};  {connected(tex)}")
+            slots[name] = {"kind": "texture", "name": name, "texture": tex.name}
+        for name, tex in p.options.get("writes", {}).items():
+            lines.append(f"RWTexture2D<{FORMATS[tex.format][1]}> {name};  {connected(tex)}")
+            slots[name] = {"kind": "storage", "name": name, "texture": tex.name}
+        lines += ["SamplerState linear_sampler;   // blends the four nearest texels",
+                  "SamplerState nearest_sampler;  // takes the nearest texel"]
+        slots["linear_sampler"] = {"kind": "sampler", "filter": "linear"}
+        slots["nearest_sampler"] = {"kind": "sampler", "filter": "nearest"}
+        return "\n".join(lines) + "\n", slots
+
+    def _shader_error(self, p: Pass, diagnostics: str) -> ShaderError:
+        missing = re.search(r"no function found matching entry point name '([^']+)'", diagnostics)
+        located = [m for severity, m in slang.split_diagnostics(diagnostics)
+                   if severity == "error" and "-->" in m and "entry point name" not in m]
+        if missing and not located:
+            option = "entry" if p.kind == "compute" else ("vertex" if missing.group(1) == p.options["vertex"] else "pixel")
+            return ShaderError(p.name, diagnostics,
+                               f'pass "{p.name}": its shader has no function named "{missing.group(1)}", which is the one '
+                               f'this pass runs. Rename your function, or say which one to run with {option}="...".')
+        if not self.vars and "undefined identifier 'vars'" in diagnostics:
+            diagnostics += ("\n\nThis technique has no variables yet. Declare one with var(name, value) "
+                            "and the shader can read it as vars.<name>.")
+        return ShaderError(p.name, diagnostics)
+
+    def _compile_pass(self, p: Pass):
+        """Compile one pass. Returns its part of the program, warnings, and the reflection data."""
+        declarations, slots = self._declarations(p)
+        o = p.options
+        entries = ((o["entry"], "compute"),) if p.kind == "compute" else ((o["vertex"], "vertex"), (o["pixel"], "fragment"))
+        try:
+            compiled = slang.compile(((DECLARED, declarations), (p.name, p.code)), entries)
+        except slang.CompileError as e:
+            raise self._shader_error(p, e.diagnostics) from None
+        reflection = compiled.reflection
+
+        stages = {}
+        for (entry, stage), wgsl in zip(entries, compiled.wgsl):
+            pixel_only = re.search(r"\b(" + "|".join(PIXEL_ONLY) + r")\s*\(", wgsl) if stage != "fragment" else None
+            if pixel_only:
+                hlsl = PIXEL_ONLY[pixel_only.group(1)]
+                advice = ("use SampleLevel(sampler, uv, 0) instead, which names the mip level itself"
+                          if hlsl.startswith("Sample") else "compute the difference yourself from neighbouring values")
+                raise TechniqueError(f'pass "{p.name}": {hlsl}() needs screen-space derivatives, which exist only in a '
+                                     f"pixel shader. In a {stage} shader, {advice}.")
+            stages[stage] = {"entry": entry, "code": wgsl}
+
+        # Which binding each declared name got, and which names the entry points really use.
+        index = {q["name"]: q["binding"].get("index") for q in reflection["parameters"]}
+        used = {b["name"] for e in reflection["entryPoints"] for b in e.get("bindings", []) if b["binding"].get("used")}
+        bindings = []
+        for name, slot in slots.items():
+            if name not in used:
+                continue
+            if index.get(name) is None:
+                raise slang.SlangError(f'pass "{p.name}": Slang {slang.version()} reported no binding for "{name}"')
+            binding = dict(slot, binding=index[name])
+            if slot["kind"] == "storage":
+                tex = o["writes"][name]
+                stages["compute"]["code"], reads = _retarget_storage(stages["compute"]["code"], binding["binding"], tex.format)
+                if reads and tex.format not in READ_WRITE_FORMATS:
+                    raise TechniqueError(
+                        f'pass "{p.name}": the shader reads "{name}", the texture it also writes ("{tex.name}", {tex.format}). '
+                        f"WebGPU allows reading and writing one texture in the same pass only for the formats "
+                        f'{" and ".join(READ_WRITE_FORMATS)}. Read from a second texture instead.')
+                if reads:
+                    binding["access"] = "read-write"
+            bindings.append(binding)
+
+        warnings = [f'pass "{p.name}": "{n}" is connected but the shader never uses it'
+                    for n in [*p.reads, *o.get("writes", {})] if n not in used]
+        warnings += [f'pass "{p.name}": {message}'
+                     for severity, message in slang.split_diagnostics(compiled.diagnostics) if severity == "warning"]
+
+        out = {"kind": p.kind, "name": p.name, "stages": stages, "bindings": bindings}
+        if p.kind == "compute":
+            entry = next(e for e in reflection["entryPoints"] if e["name"] == o["entry"])
+            out["dispatch"] = {"texture": o["over"].name, "workgroup": list(entry["threadGroupSize"])}
+        else:
+            out.update(vertexCount=o["vertices"], instanceCount=o["instances"], topology=o["topology"], cull=o["cull"],
+                       targets=[{"texture": t.name, "clear": list(o["clear"]) if o["clear"] else None} for t in o["targets"]],
+                       depth={"texture": o["depth"].name} if o["depth"] else None,
+                       mesh=o["mesh"].name if o["mesh"] else None)
+        return out, warnings, declarations, reflection
+
+    def _layout_vars(self, reflection: dict):
+        """Where each variable sits in the constant buffer. The compiler decides; this reads it back."""
+        if not self.vars:
+            return {"size": 0, "fields": []}
+        layout = next(q for q in reflection["parameters"] if q["name"] == "vars")["type"]["elementVarLayout"]
+        offsets = {f["name"]: f["binding"]["offset"] for f in layout["type"]["fields"]}
+        fields = []
         for v in self.vars:
-            scalar, count, align, size = VAR_TYPES[v.type]
-            offset = math.ceil(offset / align) * align
-            fields.append({"name": v.name, "type": v.type, "scalar": scalar, "count": count, "offset": offset,
+            scalar, count = VAR_TYPES[v.type]
+            fields.append({"name": v.name, "type": v.type, "scalar": scalar, "count": count, "offset": offsets[v.name],
                            "value": int(v.value) if isinstance(v.value, bool) else v.value,
                            "min": v.min, "max": v.max, "step": v.step, "ui": v.ui, "doc": v.doc})
-            offset += size
-            largest = max(largest, align)
-        return {"size": math.ceil(offset / largest) * largest if fields else 0, "fields": fields}
-
-    def _preamble(self, p: Pass):
-        """The declarations this pass's code needs, and the matching binding list."""
-        code = _strip_comments(p.code)
-        lines, bindings = [f'// ---- declared for you: pass "{p.name}" ----'], []
-
-        def bind(entry, declaration):
-            entry["binding"] = len(bindings)
-            bindings.append(entry)
-            lines.append(f"@group(0) @binding({entry['binding']}) {declaration}")
-
-        used_vars = set(re.findall(r"(?<![A-Za-z0-9_.])vars\.([A-Za-z_][A-Za-z0-9_]*)", code))
-        unknown = used_vars - {v.name for v in self.vars}
-        if unknown:
-            known = ", ".join(v.name for v in self.vars) or "none are defined"
-            raise TechniqueError(f'pass "{p.name}": the shader uses vars.{sorted(unknown)[0]}, '
-                                 f"which is not a variable of this technique (known: {known})")
-        if used_vars:
-            members = "\n".join(f"  {v.name}: {v.type}," for v in self.vars)
-            lines.append(f"struct Vars {{\n{members}\n}}")
-            bind({"kind": "vars"}, "var<uniform> vars: Vars;")
-        if re.search(r"(?<![A-Za-z0-9_.])sys\.", code):
-            lines.append(SYS_STRUCT)
-            bind({"kind": "sys"}, "var<uniform> sys: Sys;")
-        if p.options.get("mesh") and _uses(code, "Vertex") and not re.search(r"struct\s+Vertex\b", code):
-            lines.append(VERTEX_STRUCT)
-        for wgsl_name, tex in p.reads.items():
-            bind({"kind": "texture", "name": wgsl_name, "texture": tex.name}, f"var {wgsl_name}: {FORMATS[tex.format][1]};")
-        for wgsl_name, tex in p.options.get("writes", {}).items():
-            bind({"kind": "storage", "name": wgsl_name, "texture": tex.name},
-                 f"var {wgsl_name}: texture_storage_2d<{tex.format}, write>;")
-        for filt in ("linear", "nearest"):
-            if _uses(code, f"{filt}_sampler"):
-                bind({"kind": "sampler", "filter": filt}, f"var {filt}_sampler: sampler;")
-        lines.append("// ---- your code ----")
-
-        unused = [n for n in list(p.reads) + list(p.options.get("writes", {})) if not _uses(code, n)]
-        return "\n".join(lines) + "\n", bindings, unused
-
-    @staticmethod
-    def _workgroup(p: Pass):
-        code, entry = _strip_comments(p.code), p.options["entry"]
-        for attrs, fn in re.findall(r"((?:@\w+(?:\s*\([^)]*\))?\s*)+)fn\s+(\w+)", code):
-            if fn != entry:
-                continue
-            m = re.search(r"@workgroup_size\s*\(([^)]*)\)", attrs)
-            if not m:
-                break
-            try:
-                size = [int(x.strip().rstrip("u")) for x in m.group(1).split(",") if x.strip()]
-            except ValueError:
-                raise TechniqueError(f'pass "{p.name}": @workgroup_size({m.group(1)}) must use integer literals') from None
-            return (size + [1, 1])[:3]
-        raise TechniqueError(f'pass "{p.name}": no compute entry point "@compute @workgroup_size(...) fn {entry}" found in its shader')
+        return {"size": layout["binding"]["size"], "fields": fields}
 
     def compile(self) -> "Program":
         if not self.passes:
             raise TechniqueError("the technique has no passes yet: add one with compute(...) or draw(...)")
-        passes, warnings = [], []
+        passes, warnings, sources, reflection = [], [], {}, {}
         for p in self.passes:
-            preamble, bindings, unused = self._preamble(p)
-            for n in unused:
-                warnings.append(f'pass "{p.name}": "{n}" is connected but the shader never uses it')
-            out = {"kind": p.kind, "name": p.name, "code": preamble + p.code, "bindings": bindings,
-                   "preambleLines": preamble.count("\n")}
-            if p.kind == "compute":
-                out.update(entry=p.options["entry"],
-                           dispatch={"texture": p.options["over"].name, "workgroup": self._workgroup(p)})
-            else:
-                o = p.options
-                for stage in ("vertex", "fragment"):
-                    if not re.search(rf"@{stage}[^{{]*?fn\s+{re.escape(o[stage])}\b", _strip_comments(p.code), flags=re.S):
-                        raise TechniqueError(f'pass "{p.name}": no entry point "@{stage} fn {o[stage]}" found in its shader')
-                out.update(vertex=o["vertex"], fragment=o["fragment"], vertexCount=o["vertices"],
-                           instanceCount=o["instances"], topology=o["topology"], cull=o["cull"],
-                           targets=[{"texture": t.name, "clear": list(o["clear"]) if o["clear"] else None} for t in o["targets"]],
-                           depth={"texture": o["depth"].name} if o["depth"] else None,
-                           mesh=o["mesh"].name if o["mesh"] else None)
+            out, notes, declarations, reflection = self._compile_pass(p)
             passes.append(out)
+            warnings += notes
+            sources[p.name] = (declarations, p.code)
         return Program({
             "name": self.name,
             "textures": [{"name": t.name, "format": t.format, "size": list(t.size), **({"data": t.data} if t.data else {})}
                          for t in self.textures],
-            "vars": self._layout_vars(),
+            "vars": self._layout_vars(reflection),   # every pass declares the same Vars, so any reflection will do
             "meshes": [{"name": m.name, "vertexCount": m.vertex_count, "vertices": m.vertices,
                         "indexCount": m.index_count, **({"indices": m.indices} if m.indices else {})} for m in self.meshes],
             "passes": passes,
             "view": (self.view or self.textures[0]).name,
-        }, warnings)
+        }, warnings, sources)
 
     # ---- notebook ------------------------------------------------------------
 
@@ -465,23 +533,71 @@ class Technique:
         textures = list(texture) if many else [texture]
         for tex in textures:
             self._owns(tex, "read")
-        arrays = headless.run(self.compile(), read=[tex.name for tex in textures], frames=frames, vars=vars)
+        values = {}
+        for name, value in vars.items():
+            var = next((v for v in self.vars if v.name == name), None)
+            if var is None:
+                known = ", ".join(v.name for v in self.vars) or "none are defined"
+                raise TechniqueError(f'read(): "{name}" is not a variable of this technique (known: {known})')
+            values[name] = _matrix(value) if var.type == "float4x4" else np.asarray(value).tolist()
+        arrays = headless.run(self.compile(), read=[tex.name for tex in textures], frames=frames, vars=values)
         return [arrays[tex.name] for tex in textures] if many else arrays[texture.name]
+
+
+def _matrix(value) -> list[float]:
+    """The sixteen numbers of a float4x4, row after row: numpy's own order, and the order in
+    which Slang lays a matrix out in a constant buffer."""
+    m = np.asarray(value, np.float32)
+    if m.shape != (4, 4):
+        raise TechniqueError(f"a float4x4 variable needs a 4x4 array, got shape {m.shape}")
+    return [float(x) for x in m.reshape(-1)]
+
+
+def _retarget_storage(wgsl: str, binding: int, fmt: str):
+    """Fix up the declaration of one texture a compute shader writes.
+
+    Slang declares every RWTexture2D as read_write storage with a format guessed from the
+    HLSL type. WebGPU wants the texture's real format, and write-only access unless the
+    shader also reads it. Returns the new WGSL and whether the shader reads the texture.
+    """
+    found = re.search(rf"(@binding\({binding}\)\s*@group\(0\)\s*var\s+(\w+)\s*:\s*texture_storage_2d)<[^>]*>", wgsl)
+    if not found:
+        raise slang.SlangError(f"binding {binding} is not declared as a storage texture in the compiled WGSL; "
+                               f"Slang {slang.version()} writes it in a form this code does not know")
+    reads = re.search(rf"\btextureLoad\s*\(\s*\(*\s*{found.group(2)}\b", wgsl) is not None
+    access = "read_write" if reads else "write"
+    return wgsl[:found.start()] + f"{found.group(1)}<{fmt}, {access}>" + wgsl[found.end():], reads
 
 
 class Program:
     """A compiled technique: JSON for the runtime, plus what the compiler noticed."""
 
-    def __init__(self, json: dict, warnings: list[str]):
+    def __init__(self, json: dict, warnings: list[str], sources: dict[str, tuple[str, str]]):
         self.json = json
         self.warnings = warnings
+        self._sources = sources   # pass name -> (generated declarations, the author's code)
 
-    def wgsl(self, pass_name: str) -> str:
-        """The complete shader of one pass, including the generated declarations."""
-        for p in self.json["passes"]:
-            if p["name"] == pass_name:
-                return p["code"]
-        raise KeyError(pass_name)
+    def declarations(self, pass_name: str) -> str:
+        """The HLSL the system wrote in front of one pass's code."""
+        return self._sources[pass_name][0]
+
+    def hlsl(self, pass_name: str) -> str:
+        """The complete HLSL of one pass: the generated declarations, then the author's code."""
+        declarations, code = self._sources[pass_name]
+        return declarations + "// ---- your code ----\n" + code
+
+    def wgsl(self, pass_name: str, stage: str | None = None) -> str:
+        """What one pass was compiled to: the WGSL the GPU runs.
+
+        A draw pass has two shaders; `stage="vertex"` or `stage="pixel"` selects one.
+        """
+        stages = next(p for p in self.json["passes"] if p["name"] == pass_name)["stages"]
+        if stage is not None:
+            return stages["fragment" if stage == "pixel" else stage]["code"]
+        if len(stages) == 1:
+            return next(iter(stages.values()))["code"]
+        return "\n".join(f'// ---- {"pixel" if s == "fragment" else s} shader: {v["entry"]} ----\n{v["code"]}'
+                         for s, v in stages.items())
 
     def __repr__(self):
         j = self.json

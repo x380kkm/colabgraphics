@@ -8,6 +8,9 @@
 资源创建、绑定、管线、每帧调度、变量界面这些样板由系统生成。
 描述和着色器写在 notebook 单元格里，渲染用 WebGPU 跑在读者自己的浏览器里。
 
+着色器用 **HLSL** 写，这是工业界写着色器最通用的语言。浏览器里的 WebGPU 只运行 WGSL，
+中间由 [Slang](https://shader-slang.org) 编译器翻译，和 Gigi 输出 WebGPU 时走的是同一条路。
+
 | notebook | 内容 | |
 |---|---|---|
 | 第一步 | 三角形、变量、两个 pass 的模糊、用 numpy 核对 | [![在 Colab 中打开](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/x380kkm/colabgraphics/blob/dev/notebooks/01_first_steps.ipynb) |
@@ -23,15 +26,16 @@
 import colabgraphics as cg
 
 BLUR = """
-@compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) id: vec3u) {
-  let p = vec2i(id.xy);
-  let size = vec2i(textureDimensions(image));
-  var sum = vec4f(0);
-  for (var i = -vars.radius; i <= vars.radius; i++) {
-    sum += textureLoad(image, clamp(p + i * DIR, vec2i(0), size - 1), 0);
-  }
-  textureStore(result, p, sum / f32(2 * vars.radius + 1));
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    uint2 size;
+    image.GetDimensions(size.x, size.y);
+    float4 sum = 0;
+    for (int i = -vars.radius; i <= vars.radius; i++)
+        sum += image[clamp(p + i * DIR, int2(0, 0), int2(size) - 1)];
+    result[p] = sum / float(2 * vars.radius + 1);
 }
 """
 
@@ -41,24 +45,53 @@ tmp = t.texture("tmp", like=src)              # 尺寸和格式跟随 src
 out = t.texture("out", like=src)
 t.var("radius", 6, min=0, max=32)             # 画面旁边自动出现滑块
 
-t.compute("blur_h", "const DIR = vec2i(1, 0);" + BLUR, reads={"image": src}, writes={"result": tmp})
-t.compute("blur_v", "const DIR = vec2i(0, 1);" + BLUR, reads={"image": tmp}, writes={"result": out})
+t.compute("blur_h", "static const int2 DIR = int2(1, 0);" + BLUR, reads={"image": src}, writes={"result": tmp})
+t.compute("blur_v", "static const int2 DIR = int2(0, 1);" + BLUR, reads={"image": tmp}, writes={"result": out})
 
 t.show()                # 活的画面，存进 notebook
 t.read(out, radius=4)   # 无头执行，返回 numpy 数组，用于断言
 ```
 
-着色器里的 `image`、`result`、`vars` 都不用声明：编译器按 `reads=`、`writes=` 和 `var()` 生成声明，
-`t.compile().wgsl("blur_h")` 可以看到完整结果。
+着色器里的 `image`、`result`、`vars` 都不用声明。编译器按 `reads=`、`writes=` 和 `var()` 在你的代码前面补上声明
+（`Texture2D<float4> image;`、`RWTexture2D<float4> result;`、`ConstantBuffer<Vars> vars;`），再交给 Slang 编译。
+两头都可以看：
+
+```python
+program = t.compile()
+print(program.declarations("blur_h"))   # 系统替你写的 HLSL 声明
+print(program.wgsl("blur_h"))           # 编译出来、浏览器实际运行的 WGSL
+```
+
+写错了在 `compile()`、`show()`、`read()` 时就报错，指明是哪个 pass 的第几行：
+
+```
+pass "blur_h": the shader does not compile.
+
+error[E30027]: member not found
+  --> blur_h:11:38
+   |
+11 | result[p] = sum / float(2 * vars.raduis + 1);
+   |                                  ^^^^^^ 'raduis' is not a member of 'Vars'.
+```
+
+约定：
+
+- 入口函数默认叫 `CSMain`（compute pass）、`VSMain` 和 `PSMain`（draw pass），可以用 `entry=`、`vertex=`、`pixel=` 改。
+- `var()` 的类型跟随默认值：`int`、`float`、2 到 4 个数的元组（`float2` 到 `float4`）、4×4 的 numpy 数组（`float4x4`）。
+  `bool` 在着色器里是取 0 或 1 的 `uint`。
+- 矩阵按数学上的习惯给：着色器里的 `mul(vars.m, v)` 等于 numpy 里的 `m @ v`。
+- `sys.time`、`sys.frame`、`sys.resolution`、`sys.mouse` 由系统提供；`linear_sampler`、`nearest_sampler` 是两个现成的采样器。
+- 源语言实际上是 Slang，它是 HLSL 的超集，所以泛型、接口这些 Slang 的特性也能用。
 
 ## 现在有什么
 
 | 部件 | 状态 |
 |---|---|
-| 技术描述与编译器（`technique.py`） | 纹理、变量、compute pass、draw pass；生成绑定声明和 `vars` 结构体；错误信息指明 pass 和原因 |
+| 技术描述与编译器（`technique.py`） | 纹理、变量、网格、compute pass、draw pass；为每个 pass 生成 HLSL 声明；绑定号、变量在常量缓冲里的偏移、线程组大小都取自编译器的反射数据 |
+| 着色器编译（`slang.py`） | 在 Python 进程内通过 C 接口调用 Slang，HLSL 进、WGSL 出；报错指明 pass 和作者代码的行号，并作为 Python 异常抛出 |
 | 运行时（`js/runtime.js`） | 同一个文件在浏览器和 Node + Dawn 下运行 |
 | 查看器（`js/viewer.js`、`display.py`） | 自包含 HTML 输出；每个变量一个控件；pass 流程条，点纹理名看中间结果 |
-| 无头执行（`headless.py`） | `read()` 返回 numpy；着色器报错指回作者的行号 |
+| 无头执行（`headless.py`） | `read()` 返回 numpy，可以临时改变量的值 |
 | Blender 桥（`blender.py`） | 场景取成数组（三角形、材质颜色、相机矩阵、灯光）；Blender 的光线求交给出深度与覆盖的参考；Cycles 渲染参考图 |
 | 测试 | 浏览器与无头两条路径都和 numpy 参考实现比对；光栅化结果与 Blender 的光线求交比对；另有针对真实 Colab 前端的检查 |
 
@@ -81,7 +114,7 @@ t = cg.Technique("scene")
 color = t.texture("color", size=data.resolution)
 mesh = t.mesh("scene", data.positions, data.normals, data.uvs, data.colors)
 t.var("view_projection", data.camera.view_projection)
-t.draw("raster", SHADER, targets=[color], mesh=mesh, depth=True)
+t.draw("raster", SHADER, targets=[color], mesh=mesh, depth=True)   # 顶点着色器里: mul(vars.view_projection, float4(v.position, 1))
 
 ref = blender.reference()                 # 每个像素该看到什么：深度、覆盖、法线
 picture = blender.render(samples=48)      # Cycles 对同一场景的渲染
@@ -94,8 +127,8 @@ picture = blender.render(samples=48)      # Cycles 对同一场景的渲染
 
 | 部件 | 在哪里运行 | 作用 |
 |---|---|---|
-| 技术描述 | notebook 单元格 | 用 Python 声明资源、变量和 pass；着色器用 WGSL 只写算法部分 |
-| 编译器 | Colab VM（Python） | 校验描述，为着色器生成绑定声明和变量结构体，产出给运行时执行的程序（JSON） |
+| 技术描述 | notebook 单元格 | 用 Python 声明资源、变量和 pass；着色器用 HLSL 只写算法部分 |
+| 编译器 | Colab VM（Python） | 校验描述，为着色器生成 HLSL 声明，用 Slang 编译成 WGSL，产出给运行时执行的程序（JSON） |
 | 运行时 | 浏览器，以及 VM 里的无头环境 | 同一份程序在读者的 GPU 上实时运行，也能在 VM 里无头运行以便读回、断言和 CI |
 | 快照查看器 | 读者的浏览器 | `show()` 输出的自包含 HTML，存进 notebook，重开后不需要运行时 |
 | 工作台（未实现） | 浏览器 ↔ VM | Gradio 式路径（VM 里的 HTTP 服务 + iframe）：改着色器、重编译、调试 |
@@ -126,6 +159,19 @@ Colab VM（官方 [backend-info](https://github.com/googlecolab/backend-info)，
   13 个只在边缘像素有差异，3 个光追测试超时。所以跨实现的结果比较必须用容差。
 - Node 可以用 pip 装（PyPI 上的 `nodejs-wheel-binaries`）。
 
+Slang（同一台 Linux，Python 3.13，`pip install slangpy` 得到的 2026.12 版）：
+
+- PyPI 上的 `slangpy` 包里带着 Slang 编译器的动态库（`libslang-compiler.so`，约 30 MB；整个包约 92 MB），
+  用 ctypes 调它的 C 接口即可，不需要导入 `slangpy`，也不需要 `slangc` 可执行文件。
+- 第一次建立编译会话约 0.2 秒，之后每个 pass 编译 20 到 80 毫秒。
+- 不写绑定号时，Slang 按声明顺序分配，反射数据里能读到每个资源的绑定号、是否被入口函数用到，
+  以及常量缓冲里每个成员的偏移。没用到的资源不会出现在生成的 WGSL 里。
+- `RWTexture2D` 一律生成成 `read_write` 的存储纹理，格式按类型猜。WebGPU 只允许 `r32float`、`r32uint` 这类格式读写同一张，
+  所以这里和 Gigi 一样，在生成的 WGSL 里把声明改成纹理的真实格式和只写访问。
+- 常量缓冲里的 `bool` 会被原样写进 WGSL，而 WGSL 不允许，所以布尔变量声明成 `uint`。
+- 矩阵在常量缓冲里按行存放，`mul(M, v)` 生成的是 WGSL 的 `v * M`。按行写入 numpy 矩阵，结果与 `M @ v` 一致。
+- 在 compute 着色器里调用 `Sample()`，Slang 不报错，要等到浏览器才被拒绝，所以这里在编译后自己检查并报错。
+
 Blender（同一台 Linux，Python 3.13）：
 
 - PyPI 上的 `bpy` 5.2.3 要求的 Python 版本正是 3.13，与 Colab 当前版本一致；安装约 40 秒，下载 403 MB。
@@ -135,6 +181,7 @@ Blender（同一台 Linux，Python 3.13）：
 
 尚未在真实 Colab 里测过的，都是需要登录才能执行的部分：
 
+- `pip install slangpy` 之后 Slang 在 Colab 的 VM 里能否直接加载（这里的系统和 Python 版本与 Colab 相同）。
 - `read()` 的无头执行在 Colab 的 VM 里能否直接工作（那里没有 Node，驱动只有 Mesa 的 OpenGL ES）。
 - `pip install bpy` 之后 Blender 在 Colab 的 VM 里能否直接导入和渲染。
 - 内核与浏览器之间的通道（`eval_js`、comm、端口代理）。`experiments/colab-probe/colab_probe.ipynb` 是为此准备的探针。
@@ -142,7 +189,8 @@ Blender（同一台 Linux，Python 3.13）：
 ## 目录
 
 ```
-src/colabgraphics/    Python 包：technique.py（描述与编译）、display.py、headless.py、js/（运行时与查看器）
+src/colabgraphics/    Python 包：technique.py（描述与编译）、slang.py（HLSL 到 WGSL）、display.py、headless.py、
+                      blender.py、js/（运行时与查看器）
 notebooks/            notebook；src/ 下是它们的源文件，由 tools/build_notebook.py 生成带输出的 .ipynb
 examples/             单文件示例
 tests/                端到端测试
@@ -153,7 +201,7 @@ docs/images/          截图
 
 ## 开发
 
-需要 Node 和 Playwright 自带的 Chromium；没有 GPU 的机器上，WebGPU 由 Chromium 自带的 SwiftShader 提供。
+需要 Node、Playwright 自带的 Chromium，以及 `pip install numpy slangpy`；没有 GPU 的机器上，WebGPU 由 Chromium 自带的 SwiftShader 提供。
 
 ```bash
 # 端到端测试：Python 描述 -> 浏览器或无头执行 -> 与 numpy 比对

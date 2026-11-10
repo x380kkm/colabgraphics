@@ -4,8 +4,11 @@
 # 这本 notebook 里的画面都是活的：它们随文件一起保存，打开时就在你的浏览器里用 WebGPU 渲染，
 # **不需要连接运行时**。想改代码再连。
 #
-# 写法只有两部分：用 Python 说明"有哪些纹理、哪些变量、依次跑哪些 pass"，用 WGSL 写每个 pass 的算法。
+# 写法只有两部分：用 Python 说明"有哪些纹理、哪些变量、依次跑哪些 pass"，用 HLSL 写每个 pass 的着色器。
 # 创建资源、绑定、管线、每帧调度这些，由系统生成。
+#
+# 着色器语言用 HLSL，因为它是工业界写着色器最通用的语言。浏览器里的 WebGPU 只认 WGSL，
+# 中间由 Slang 编译器翻译，这和 EA 的原型工具 Gigi 输出 WebGPU 时的做法相同。
 
 # %%
 %pip install -q git+https://github.com/x380kkm/colabgraphics@dev
@@ -16,19 +19,31 @@ import colabgraphics as cg
 # ## 一个三角形
 #
 # 一张纹理，一个 draw pass。顶点位置直接写在顶点着色器里，所以连顶点缓冲都不需要。
+#
+# `VSMain` 是顶点着色器，`PSMain` 是像素着色器。冒号后面的 `SV_Position`、`SV_Target` 叫语义，
+# 说明这个值的用途：裁剪空间位置、写进渲染目标的颜色。
 
 # %%
 TRIANGLE = """
-struct Out { @builtin(position) pos: vec4f, @location(0) color: vec3f }
+struct VSOut
+{
+    float4 position : SV_Position;
+    float3 color    : COLOR0;
+};
 
-@vertex fn vs(@builtin(vertex_index) i: u32) -> Out {
-  let corners = array(vec2f(0.0, 0.8), vec2f(-0.8, -0.8), vec2f(0.8, -0.8));
-  let colors = array(vec3f(1, 0.3, 0.2), vec3f(0.2, 1, 0.4), vec3f(0.3, 0.4, 1));
-  return Out(vec4f(corners[i], 0, 1), colors[i]);
+VSOut VSMain(uint id : SV_VertexID)
+{
+    static const float2 corners[3] = { float2(0.0, 0.8), float2(-0.8, -0.8), float2(0.8, -0.8) };
+    static const float3 colors[3]  = { float3(1, 0.3, 0.2), float3(0.2, 1, 0.4), float3(0.3, 0.4, 1) };
+    VSOut o;
+    o.position = float4(corners[id], 0, 1);
+    o.color = colors[id];
+    return o;
 }
 
-@fragment fn fs(in: Out) -> @location(0) vec4f {
-  return vec4f(in.color, 1);
+float4 PSMain(VSOut input) : SV_Target
+{
+    return float4(input.color, 1);
 }
 """
 
@@ -45,19 +60,27 @@ tri.show()
 
 # %%
 SPIN = """
-struct Out { @builtin(position) pos: vec4f, @location(0) color: vec3f }
+struct VSOut
+{
+    float4 position : SV_Position;
+    float3 color    : COLOR0;
+};
 
-@vertex fn vs(@builtin(vertex_index) i: u32) -> Out {
-  let corners = array(vec2f(0.0, 0.8), vec2f(-0.8, -0.8), vec2f(0.8, -0.8));
-  let colors = array(vec3f(1, 0.3, 0.2), vec3f(0.2, 1, 0.4), vec3f(0.3, 0.4, 1));
-  let a = sys.time * vars.speed;
-  let p = corners[i] * vars.scale;
-  let rotated = vec2f(p.x * cos(a) - p.y * sin(a), p.x * sin(a) + p.y * cos(a));
-  return Out(vec4f(rotated, 0, 1), colors[i]);
+VSOut VSMain(uint id : SV_VertexID)
+{
+    static const float2 corners[3] = { float2(0.0, 0.8), float2(-0.8, -0.8), float2(0.8, -0.8) };
+    static const float3 colors[3]  = { float3(1, 0.3, 0.2), float3(0.2, 1, 0.4), float3(0.3, 0.4, 1) };
+    float a = sys.time * vars.speed;
+    float2 p = corners[id] * vars.scale;
+    VSOut o;
+    o.position = float4(p.x * cos(a) - p.y * sin(a), p.x * sin(a) + p.y * cos(a), 0, 1);
+    o.color = colors[id];
+    return o;
 }
 
-@fragment fn fs(in: Out) -> @location(0) vec4f {
-  return vec4f(mix(in.color, vars.tint.rgb, vars.tint_amount), 1);
+float4 PSMain(VSOut input) : SV_Target
+{
+    return float4(lerp(input.color, vars.tint, vars.tint_amount), 1);
 }
 """
 
@@ -77,13 +100,22 @@ spin.show()
 # 这不是黑箱，随时可以看：
 
 # %%
-print(spin.compile().wgsl("tri").split("// ---- your code ----")[0])
+program = spin.compile()
+print(program.declarations("tri"))
+
+# %% [markdown]
+# 编译的结果也可以看。下面是上面那个像素着色器被翻译成的 WGSL，浏览器实际运行的就是它：
+
+# %%
+print(program.wgsl("tri", stage="pixel"))
 
 # %% [markdown]
 # ## 两个 pass：可分离的 box blur
 #
 # 先横向模糊到一张中间纹理，再纵向模糊到结果。同一段着色器代码用两次，只是方向不同。
-# 在着色器里，`image` 和 `result` 这两个名字由 `reads=` 和 `writes=` 接到具体的纹理上。
+# 这次用 compute pass：`CSMain` 对输出纹理的每个像素运行一次，`[numthreads(8, 8, 1)]` 是每组线程的大小。
+# 在着色器里，`image` 和 `result` 这两个名字由 `reads=` 和 `writes=` 接到具体的纹理上：
+# 读的是 `Texture2D`，写的是 `RWTexture2D`。
 #
 # 画面下方那一行是这个技术的流程。点里面的纹理名，可以看任意一步的中间结果。
 
@@ -94,15 +126,16 @@ grid = ((x // 32 + y // 32) % 2 == 0)[..., None] * 0.35
 picture = (np.clip(waves * (0.65 + grid), 0, 1) * 255).astype(np.uint8)
 
 BLUR = """
-@compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) id: vec3u) {
-  let p = vec2i(id.xy);
-  let size = vec2i(textureDimensions(image));
-  var sum = vec4f(0);
-  for (var i = -vars.radius; i <= vars.radius; i++) {
-    sum += textureLoad(image, clamp(p + i * DIR, vec2i(0), size - 1), 0);
-  }
-  textureStore(result, p, sum / f32(2 * vars.radius + 1));
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    uint2 size;
+    image.GetDimensions(size.x, size.y);
+    float4 sum = 0;
+    for (int i = -vars.radius; i <= vars.radius; i++)
+        sum += image[clamp(p + i * DIR, int2(0, 0), int2(size) - 1)];
+    result[p] = sum / float(2 * vars.radius + 1);
 }
 """
 
@@ -112,8 +145,8 @@ tmp = blur.texture("tmp", like=src)
 out = blur.texture("out", like=src)
 blur.var("radius", 6, min=0, max=32, doc="模糊半径，像素")
 
-blur.compute("blur_h", "const DIR = vec2i(1, 0);" + BLUR, reads={"image": src}, writes={"result": tmp})
-blur.compute("blur_v", "const DIR = vec2i(0, 1);" + BLUR, reads={"image": tmp}, writes={"result": out})
+blur.compute("blur_h", "static const int2 DIR = int2(1, 0);" + BLUR, reads={"image": src}, writes={"result": tmp})
+blur.compute("blur_v", "static const int2 DIR = int2(0, 1);" + BLUR, reads={"image": tmp}, writes={"result": out})
 blur.show()
 
 # %% [markdown]
@@ -136,3 +169,21 @@ for radius in (0, 4, 12):
     gpu = blur.read(out, radius=radius)
     worst = np.abs(gpu.astype(int) - reference(rgba, radius).astype(int)).max()
     print(f"radius {radius:2d}: GPU 与 numpy 的最大差 = {worst}/255")
+
+# %% [markdown]
+# ## 写错了会怎样
+#
+# 着色器在 Python 这一侧编译，所以错误在运行这一格时就报出来，指明是哪个 pass 的第几行（从那段着色器代码的开头数）。
+# 下面故意把 `radius` 拼错：
+
+# %%
+broken = cg.Technique("broken")
+a = broken.image("a", picture)
+b = broken.texture("b", like=a)
+broken.var("radius", 6)
+broken.compute("blur_h", "static const int2 DIR = int2(1, 0);" + BLUR.replace("2 * vars.radius", "2 * vars.raduis"),
+               reads={"image": a}, writes={"result": b})
+try:
+    broken.compile()
+except cg.ShaderError as error:
+    print(error)

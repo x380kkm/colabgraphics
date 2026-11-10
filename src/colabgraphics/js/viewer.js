@@ -172,12 +172,11 @@ function mountViewer(root, program, options = {}) {
     const runtime = await new Runtime(device, program).init();
     handle.runtime = runtime;
 
-    // Shader problems, reported against the author's own line numbers.
-    const problems = (await runtime.shaderMessages()).filter((m) => m.type === 'error').map((m) => {
-      const pass = program.passes.find((p) => p.name === m.pass);
-      const line = m.line - pass.preambleLines;
-      return `pass "${m.pass}", ${line > 0 ? 'line ' + line : 'generated declarations'}: ${m.message}`;
-    });
+    // The HLSL was already checked when it was compiled. What can still go wrong here is this
+    // browser refusing the compiled WGSL, so that is what the message quotes.
+    const problems = (await runtime.shaderMessages()).filter((m) => m.type === 'error').map((m) =>
+      `pass "${m.pass}": this browser rejected the compiled ${m.stage === 'fragment' ? 'pixel' : m.stage} shader.\n` +
+      `  ${m.message}\n  WGSL line ${m.line}: ${m.text}`);
     if (!problems.length) for (const e of runtime.errors) problems.push(e.message);
     if (problems.length) return fail(problems.join('\n'));
     device.lost.then((info) => { if (info.reason !== 'destroyed') fail('The GPU device was lost: ' + info.message); });

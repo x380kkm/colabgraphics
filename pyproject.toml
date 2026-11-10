@@ -5,10 +5,11 @@ build-backend = "hatchling.build"
 [project]
 name = "colabgraphics"
 version = "0.0.1"
-description = "Describe a rendering technique in a notebook, run it with WebGPU"
+description = "Describe a rendering technique in a notebook, write its shaders in HLSL, run it with WebGPU"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["numpy"]
+# slangpy is installed for the Slang shader compiler library it contains (HLSL to WGSL).
+dependencies = ["numpy", "slangpy"]
 
 [project.optional-dependencies]
 images = ["pillow"]

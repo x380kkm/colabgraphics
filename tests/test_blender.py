@@ -10,26 +10,37 @@ import colabgraphics as cg
 from colabgraphics import blender
 
 SHADER = """
-struct Varying {
-  @builtin(position) clip: vec4f,
-  @location(0) world: vec3f,
-  @location(1) normal: vec3f,
-  @location(2) color: vec3f,
-}
-struct Targets {
-  @location(0) color: vec4f,
-  @location(1) depth: vec4f,
+struct VSOut
+{
+    float4 position : SV_Position;
+    float3 world    : TEXCOORD0;
+    float3 normal   : NORMAL;
+    float3 color    : COLOR0;
+};
+
+struct PSOut
+{
+    float4 color : SV_Target0;
+    float  depth : SV_Target1;
+};
+
+VSOut VSMain(Vertex v)
+{
+    VSOut o;
+    o.position = mul(vars.view_projection, float4(v.position, 1));
+    o.world = v.position;
+    o.normal = v.normal;
+    o.color = v.color;
+    return o;
 }
 
-@vertex fn vs(v: Vertex) -> Varying {
-  return Varying(vars.view_projection * vec4f(v.position, 1), v.position, v.normal, v.color);
-}
-
-@fragment fn fs(in: Varying) -> Targets {
-  let lambert = max(dot(normalize(in.normal), -vars.sun_direction), 0.0);
-  let lit = in.color * (0.15 + 0.85 * lambert);
-  let view_depth = -(vars.view * vec4f(in.world, 1)).z;   // distance in front of the camera
-  return Targets(vec4f(lit, 1), vec4f(view_depth, 0, 0, 1));
+PSOut PSMain(VSOut input)
+{
+    float lambert = max(dot(normalize(input.normal), -vars.sun_direction), 0.0);
+    PSOut o;
+    o.color = float4(input.color * (0.15 + 0.85 * lambert), 1);
+    o.depth = -mul(vars.view, float4(input.world, 1)).z;   // distance in front of the camera
+    return o;
 }
 """
 
