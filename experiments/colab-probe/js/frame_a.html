@@ -1,0 +1,19 @@
+<div id="gigi-probe-a" style="font: 13px monospace">frame A: starting…</div>
+<script>
+  // "Frame A": a marker that a later cell will try to reach.
+  window.gigiProbeMarker = 'frame-A';
+  window.gigiProbePing = (x) => 'pong:' + x;
+  const gigiProbeLabel = document.getElementById('gigi-probe-a');
+  try {
+    const bc = new BroadcastChannel('gigi-probe');
+    bc.onmessage = (ev) => {
+      if (ev.data && ev.data.ping) {
+        bc.postMessage({ pong: ev.data.ping });
+        gigiProbeLabel.textContent = 'frame A: answered a broadcast from another cell';
+      }
+    };
+  } catch (e) { /* no BroadcastChannel */ }
+  const gigiProbeAccess = ((self.google || {}).colab || {}).kernel
+    ? google.colab.kernel.accessAllowed : 'no google.colab';
+  gigiProbeLabel.textContent = 'frame A: ready (kernel access: ' + gigiProbeAccess + ')';
+</script>

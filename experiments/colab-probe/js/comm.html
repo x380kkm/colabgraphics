@@ -1,0 +1,40 @@
+<div id="gigi-probe-comm" style="font: 13px monospace">comm probe: running…</div>
+<script>
+// The asynchronous routes from an output frame to the kernel:
+//   invokeFunction - calls a Python function registered with output.register_callback
+//   comms          - Jupyter comm channel, with binary buffers in both directions
+// Both travel on the kernel's shell channel, so the kernel only handles them
+// BETWEEN cell executions. That is why this probe reports through a comm message
+// instead of being awaited by Python.
+(async () => {
+  const label = document.getElementById('gigi-probe-comm');
+  const res = {};
+  const kernel = ((self.google || {}).colab || {}).kernel;
+  if (!kernel || !kernel.accessAllowed) {
+    label.textContent = 'comm probe: no kernel access here (this is a saved output)';
+    return;
+  }
+  const withTimeout = (p, ms) => Promise.race([p, new Promise((r) => setTimeout(() => r('<timeout>'), ms))]);
+  try {
+    const t0 = performance.now();
+    const r = await withTimeout(kernel.invokeFunction('gigi_probe_callback', [1, 'two'], { three: 3 }), 120000);
+    res.invoke = { ms: Math.round(performance.now() - t0), result: JSON.stringify(r).slice(0, 400) };
+  } catch (e) { res.invokeError = String(e); }
+  try {
+    const comm = await kernel.comms.open('gigi_probe_comm', { hello: 1 }, [new Uint8Array(1000).buffer]);
+    const incoming = comm.messages[Symbol.asyncIterator]();
+    res.comm = [];
+    for (const n of [100000, 1000000, 8000000]) {
+      const t0 = performance.now();
+      await comm.send({ echo_bytes: n }, { buffers: [new Uint8Array(n).buffer] });
+      const m = await withTimeout(incoming.next(), 120000);
+      if (m === '<timeout>' || m.done) { res.comm.push({ bytes: n, ok: false, why: String(m.done ? 'closed' : m) }); break; }
+      const got = (m.value.buffers || []).reduce((a, b) => a + b.byteLength, 0);
+      res.comm.push({ bytes: n, ok: got === n, roundtripMs: Math.round(performance.now() - t0) });
+    }
+    await comm.send({ final: res });
+    comm.close();
+  } catch (e) { res.commError = String(e); }
+  label.textContent = 'comm probe: ' + JSON.stringify(res);
+})();
+</script>
