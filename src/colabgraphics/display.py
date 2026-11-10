@@ -29,6 +29,9 @@ CSS = """
 .cg-chip { font: inherit; padding: 2px 8px; border: 1px solid transparent; border-radius: 999px; cursor: pointer;
            color: inherit; background: color-mix(in srgb, currentColor 12%, transparent); }
 .cg-chip.cg-current { border-color: currentColor; }
+.cg-probe { font-family: ui-monospace, monospace; font-size: 12px; opacity: .8; min-height: 1.5em; }
+.cg-button { font: inherit; padding: 2px 10px; border: 1px solid currentColor; border-radius: 4px; background: transparent; color: inherit; cursor: pointer; }
+.cg-button:disabled { opacity: .35; cursor: default; }
 .cg-warning { color: #b45309; }
 .cg-errors { flex-basis: 100%; margin: 0; padding: 8px 10px; white-space: pre-wrap; color: #b91c1c;
              border-left: 3px solid #b91c1c; font: 12px/1.5 ui-monospace, monospace; }

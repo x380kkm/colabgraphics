@@ -32,9 +32,10 @@ const FLAGS = ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--use-angl
     const before = handle.frames;
     await new Promise((resolve) => { const wait = () => (handle.frames >= before + 3 ? resolve() : requestAnimationFrame(wait)); wait(); });
     const t = await handle.runtime.readTexture(texture);
+    const pixel = await handle.runtime.readPixel(texture, 10, 7);   // the viewer's pixel readout uses this
     let binary = '';
     for (let i = 0; i < t.bytes.length; i += 0x8000) binary += String.fromCharCode.apply(null, t.bytes.subarray(i, i + 0x8000));
-    return { width: t.width, height: t.height, format: t.format, bytesPerPixel: t.bytesPerPixel, frames: handle.frames,
+    return { width: t.width, height: t.height, format: t.format, bytesPerPixel: t.bytesPerPixel, frames: handle.frames, pixel,
       status: document.querySelector('.cg-status').textContent, base64: btoa(binary) };
   }, { texture, sets });
   if (shot) await page.screenshot({ path: shot });

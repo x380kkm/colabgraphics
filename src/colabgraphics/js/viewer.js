@@ -118,14 +118,29 @@ function mountViewer(root, program, options = {}) {
       });
     }
   }
+  const playRow = side.appendChild(el('div', 'cg-row'));
+  const pauseButton = playRow.appendChild(el('button', 'cg-button', 'pause'));
+  const stepButton = playRow.appendChild(el('button', 'cg-button', 'step'));
+  pauseButton.type = stepButton.type = 'button';
+  stepButton.disabled = true;
+  let paused = false, stepRequested = false;
+  pauseButton.addEventListener('click', () => {
+    paused = !paused;
+    pauseButton.textContent = paused ? 'resume' : 'pause';
+    stepButton.disabled = !paused;
+  });
+  stepButton.addEventListener('click', () => { stepRequested = true; });
   side.appendChild(status);
+  const probe = side.appendChild(el('div', 'cg-probe', 'move the pointer over the picture to read pixel values'));
   for (const w of options.warnings || []) side.appendChild(el('div', 'cg-warning', w));
 
   const mouse = [0, 0, 0, 0];
+  let probeAt = null, probeBusy = false;
   const track = (e) => {
     const r = canvas.getBoundingClientRect();
     mouse[0] = (e.clientX - r.left) * canvas.width / r.width;
     mouse[1] = (e.clientY - r.top) * canvas.height / r.height;
+    probeAt = [Math.floor(mouse[0]), Math.floor(mouse[1])];
   };
   canvas.addEventListener('pointermove', track);
   canvas.addEventListener('pointerdown', (e) => { track(e); mouse[2] = 1; });
@@ -167,17 +182,31 @@ function mountViewer(root, program, options = {}) {
 
     status.textContent = `running · ${program.passes.length} passes`;
     const t0 = performance.now();
-    let last = t0, smoothed = 0;
+    let last = t0, smoothed = 0, clock = 0;
     const frame = (now) => {
       if (handle.failed) return;
       for (const [name, value] of pending) runtime.setVar(name, value);
       pending.clear();
-      runtime.frame({ time: (now - t0) / 1000, mouse });
+      if (!paused || stepRequested) {
+        // While paused the technique's clock stands still; a step advances it by one 60th of a second.
+        clock += paused ? 1 / 60 : (now - last) / 1000;
+        runtime.frame({ time: clock, mouse });
+        stepRequested = false;
+        handle.frames++;
+      }
       runtime.present(context.getCurrentTexture(), viewName);
-      handle.frames++;
+      if (probeAt && !probeBusy) {
+        const [x, y] = probeAt, name = viewName;
+        probeAt = null;
+        probeBusy = true;
+        runtime.readPixel(name, x, y).then((value) => {
+          if (value) probe.textContent = `${name}[${x}, ${y}] = ${value.map((c) => (Number.isInteger(c) ? String(c) : c.toFixed(4))).join('  ')}`;
+          handle.lastProbe = { name, x, y, value };
+        }).finally(() => { probeBusy = false; });
+      }
       smoothed = smoothed ? smoothed * 0.9 + (now - last) * 0.1 : now - last;
       last = now;
-      if (handle.frames % 20 === 0) status.textContent = `${(1000 / smoothed).toFixed(0)} fps · ${program.passes.length} passes · frame ${handle.frames}`;
+      if (handle.frames % 20 === 0 && !paused) status.textContent = `${(1000 / smoothed).toFixed(0)} fps · ${program.passes.length} passes · frame ${handle.frames}`;
       requestAnimationFrame(frame);
     };
     requestAnimationFrame(frame);

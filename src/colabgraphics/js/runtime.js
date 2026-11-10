@@ -238,6 +238,42 @@ export class Runtime {
     return { name, width, height, format: desc.format, bytesPerPixel, bytes, data: new ArrayType(bytes.buffer) };
   }
 
+  /** The value of one pixel, converted to plain numbers (unorm formats become 0..1). */
+  async readPixel(name, x, y) {
+    const { device } = this;
+    const { texture, desc } = this.textures.get(name);
+    if (x < 0 || y < 0 || x >= desc.size[0] || y >= desc.size[1]) return null;
+    const bytesPerPixel = FORMATS[desc.format][0];
+    const buffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const encoder = device.createCommandEncoder();
+    const source = { texture, origin: [x, y] };
+    if (desc.format.startsWith('depth')) source.aspect = 'depth-only';
+    encoder.copyTextureToBuffer(source, { buffer }, [1, 1]);
+    device.queue.submit([encoder.finish()]);
+    await buffer.mapAsync(GPUMapMode.READ);
+    const view = new DataView(buffer.getMappedRange().slice(0));
+    buffer.unmap();
+    buffer.destroy();
+    const f = desc.format;
+    const count = bytesPerPixel / (f.includes('32') ? 4 : f.includes('16') ? 2 : 1);
+    const half = (h) => {
+      const e = (h >> 10) & 31, m = h & 1023, sign = h & 0x8000 ? -1 : 1;
+      if (e === 0) return sign * m * 2 ** -24;
+      if (e === 31) return m ? NaN : sign * Infinity;
+      return sign * (1 + m / 1024) * 2 ** (e - 15);
+    };
+    const out = [];
+    for (let i = 0; i < count; i++) {
+      if (f.includes('32float')) out.push(view.getFloat32(i * 4, true));
+      else if (f.includes('32uint')) out.push(view.getUint32(i * 4, true));
+      else if (f.includes('16float')) out.push(half(view.getUint16(i * 2, true)));
+      else if (f.includes('snorm')) out.push(Math.max(view.getInt8(i) / 127, -1));
+      else if (f.includes('uint')) out.push(view.getUint8(i));
+      else out.push(view.getUint8(i) / 255);
+    }
+    return out;
+  }
+
   /** Draw one of the technique's textures into a render target (the canvas, in a browser). */
   present(target, name) {
     const { device } = this;

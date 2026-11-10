@@ -91,6 +91,8 @@ def test_boxblur_matches_numpy():
         assert got.shape == expected.shape
         # Each pass may round a half differently from numpy, so allow one level per pass.
         assert worst <= 2, f"radius {radius}: differs from the reference by up to {worst}/255"
+        # The single-pixel readout must agree with the full read-back.
+        assert np.allclose(np.array(info["pixel"]) * 255, got[7, 10], atol=0.01), (info["pixel"], got[7, 10])
 
 
 def test_triangle_covers_expected_pixels():
