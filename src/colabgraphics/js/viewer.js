@@ -60,7 +60,7 @@ function mountViewer(root, program, options = {}) {
     const node = graph.appendChild(el('div', 'cg-node'));
     const ins = node.appendChild(el('span', 'cg-io'));
     for (const b of pass.bindings) if (b.kind === 'texture') ins.appendChild(chip(b.texture));
-    node.appendChild(el('span', 'cg-arrow', '→'));
+    if (ins.children.length) node.appendChild(el('span', 'cg-arrow', '→'));
     const box = node.appendChild(el('span', 'cg-pass', pass.name));
     box.title = pass.kind === 'compute' ? 'compute pass' : 'draw pass';
     node.appendChild(el('span', 'cg-arrow', '→'));

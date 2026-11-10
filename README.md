@@ -4,29 +4,73 @@
 
 它是一个 Colab 原生的项目，**设计上借鉴** [Gigi](https://github.com/electronicarts/gigi)
 （EA 的渲染技术快速原型工具）的交互体验和编译器做法，但不运行 Gigi 本身，也不依赖它的编译器：
-作者只描述"有哪些资源、哪些变量、依次跑哪些 pass"并写着色器的算法部分，
+作者只描述"有哪些纹理、哪些变量、依次跑哪些 pass"并写着色器的算法部分，
 资源创建、绑定、管线、每帧调度、变量界面这些样板由系统生成。
 描述和着色器写在 notebook 单元格里，渲染用 WebGPU 跑在读者自己的浏览器里。
 
-当前阶段：**平台可行性验证完成，原生项目的设计进行中**。仓库里目前只有验证用的实验代码。
+[![在 Colab 中打开](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/x380kkm/colabgraphics/blob/first-slice/notebooks/01_first_steps.ipynb)
 
-![一个 WebGPU 技术在未登录、未连接运行时的 Colab 里渲染](docs/images/gigi_boxblur_in_colab_no_runtime.jpg)
+![第一本 notebook 在未登录、未连接运行时的 Colab 里](docs/images/notebook_in_colab.jpg)
 
-上图是真实的 Colab 页面：没有登录，没有连接运行时，单元格的输出是保存在 notebook 文件里的一段自包含 HTML，
-其中的技术用 WebGPU 实时渲染。验证平台时用的负载是 Gigi 生成的 boxblur 示例，它在这里只是替身。
+上图是真实的 Colab 页面：没有登录，没有连接运行时。画面随 notebook 文件保存，打开就在读者的浏览器里渲染。
+
+## 写起来是什么样
+
+```python
+import colabgraphics as cg
+
+BLUR = """
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let p = vec2i(id.xy);
+  let size = vec2i(textureDimensions(image));
+  var sum = vec4f(0);
+  for (var i = -vars.radius; i <= vars.radius; i++) {
+    sum += textureLoad(image, clamp(p + i * DIR, vec2i(0), size - 1), 0);
+  }
+  textureStore(result, p, sum / f32(2 * vars.radius + 1));
+}
+"""
+
+t = cg.Technique("boxblur")
+src = t.image("src", picture)                 # 一张 numpy 图片
+tmp = t.texture("tmp", like=src)              # 尺寸和格式跟随 src
+out = t.texture("out", like=src)
+t.var("radius", 6, min=0, max=32)             # 画面旁边自动出现滑块
+
+t.compute("blur_h", "const DIR = vec2i(1, 0);" + BLUR, reads={"image": src}, writes={"result": tmp})
+t.compute("blur_v", "const DIR = vec2i(0, 1);" + BLUR, reads={"image": tmp}, writes={"result": out})
+
+t.show()                # 活的画面，存进 notebook
+t.read(out, radius=4)   # 无头执行，返回 numpy 数组，用于断言
+```
+
+着色器里的 `image`、`result`、`vars` 都不用声明：编译器按 `reads=`、`writes=` 和 `var()` 生成声明，
+`t.compile().wgsl("blur_h")` 可以看到完整结果。
+
+## 现在有什么
+
+| 部件 | 状态 |
+|---|---|
+| 技术描述与编译器（`technique.py`） | 纹理、变量、compute pass、draw pass；生成绑定声明和 `vars` 结构体；错误信息指明 pass 和原因 |
+| 运行时（`js/runtime.js`） | 同一个文件在浏览器和 Node + Dawn 下运行 |
+| 查看器（`js/viewer.js`、`display.py`） | 自包含 HTML 输出；每个变量一个控件；pass 流程条，点纹理名看中间结果 |
+| 无头执行（`headless.py`） | `read()` 返回 numpy；着色器报错指回作者的行号 |
+| 测试 | 浏览器与无头两条路径都和 numpy 参考实现比对；另有针对真实 Colab 前端的检查 |
+
+还没有的：顶点和索引缓冲、采样器之外的资源类型、相机、逐 pass 的快照与像素探针、计时、
+内核连着时的实时工作台、图片的压缩存储。
 
 ## 架构
 
 | 部件 | 在哪里运行 | 作用 |
 |---|---|---|
 | 技术描述 | notebook 单元格 | 用 Python 声明资源、变量和 pass；着色器用 WGSL 只写算法部分 |
-| 编译器 | Colab VM（Python） | 校验描述，推导尺寸与格式，为着色器生成绑定声明和变量结构体，产出给运行时执行的程序 |
-| 运行时 | 浏览器，以及 VM 里的无头环境 | 同一份程序在读者的 GPU 上实时运行，也能在 VM 里无头运行以便同步读回、断言和 CI |
+| 编译器 | Colab VM（Python） | 校验描述，为着色器生成绑定声明和变量结构体，产出给运行时执行的程序（JSON） |
+| 运行时 | 浏览器，以及 VM 里的无头环境 | 同一份程序在读者的 GPU 上实时运行，也能在 VM 里无头运行以便读回、断言和 CI |
 | 快照查看器 | 读者的浏览器 | `show()` 输出的自包含 HTML，存进 notebook，重开后不需要运行时 |
-| 工作台 | 浏览器 ↔ VM | Gradio 式路径（VM 里的 HTTP 服务 + iframe）：改着色器、重编译、调试 |
-| 调试层 | 运行时内 | 每个 pass 之后的资源快照、像素探针、计时、校验信息回指到单元格 |
-
-编译器、运行时和调试层尚未实现；上表是设计方向，细节以后续提交为准。
+| 工作台（未实现） | 浏览器 ↔ VM | Gradio 式路径（VM 里的 HTTP 服务 + iframe）：改着色器、重编译、调试 |
+| 调试层（未实现） | 运行时内 | 每个 pass 之后的资源快照、像素探针、计时 |
 
 ## 已经实测的事实
 
@@ -53,41 +97,37 @@ Colab VM（官方 [backend-info](https://github.com/googlecolab/backend-info)，
   13 个只在边缘像素有差异，3 个光追测试超时。所以跨实现的结果比较必须用容差。
 - Node 可以用 pip 装（PyPI 上的 `nodejs-wheel-binaries`）。
 
-尚未在真实 Colab 里测过的：需要登录才能执行的部分，即内核与浏览器之间的通道
-（`eval_js`、comm、端口代理）。`experiments/colab-probe/colab_probe.ipynb` 是为此准备的探针。
+尚未在真实 Colab 里测过的，都是需要登录才能执行的部分：
+
+- `read()` 的无头执行在 Colab 的 VM 里能否直接工作（那里没有 Node，驱动只有 Mesa 的 OpenGL ES）。
+- 内核与浏览器之间的通道（`eval_js`、comm、端口代理）。`experiments/colab-probe/colab_probe.ipynb` 是为此准备的探针。
 
 ## 目录
 
 ```
-experiments/
-  colab-probe/        在 Colab 里手动运行的探针 notebook，及其本地排练
-  colab-automation/   用 Playwright 匿名驱动真实 Colab；快照打包器 gigi_snapshot.py
-  gradio-path/        Gradio 式路径的两个演示
-  dawn-node/          用 Node + Dawn 无头运行 Gigi 的 WebGPU 测试
+src/colabgraphics/    Python 包：technique.py（描述与编译）、display.py、headless.py、js/（运行时与查看器）
+notebooks/            notebook；src/ 下是它们的源文件，由 tools/build_notebook.py 生成带输出的 .ipynb
+examples/             单文件示例
+tests/                端到端测试
+tools/remote-browser/ 在无头机器上让人手动操作浏览器的远程画面
+experiments/          可行性验证阶段的实验（Colab 探针、匿名驱动 Colab、Gradio 式路径、Dawn 无头）
 docs/images/          截图
 ```
 
-## 复现实验
+## 开发
 
-需要 Node、Playwright 自带的 Chromium，以及一份 Gigi 的检出（下面记作 `$GIGI`）。
-WebGPU 在无 GPU 的机器上由 Chromium 自带的 SwiftShader 提供。
+需要 Node 和 Playwright 自带的 Chromium；没有 GPU 的机器上，WebGPU 由 Chromium 自带的 SwiftShader 提供。
 
 ```bash
-# 探针 notebook 的本地排练
-cd experiments/colab-probe && python3 build.py && node test_local.cjs && python3 test_cells.py
+# 端到端测试：Python 描述 -> 浏览器或无头执行 -> 与 numpy 比对
+PYTHONPATH=src python3 tests/test_techniques.py
 
-# 匿名 Colab：保存的输出是否重新执行、WebGPU 是否可用
-cd experiments/colab-automation && python3 build_saved_probe.py
-node anon_saved.cjs saved_probe.ipynb /tmp/colab.png
+# 重新生成 notebook（会执行其中的代码并保存输出）
+PYTHONPATH=src python3 tools/build_notebook.py notebooks/src/01_first_steps.py notebooks/01_first_steps.ipynb
 
-# 把 Gigi 生成的应用打包成一段自包含输出，并放进真实 Colab
-python3 gigi_snapshot.py $GIGI/_GeneratedCode/UnitTests/WebGPU UnitTests/Compute/boxblur /tmp/boxblur.html
-node anon_gigi.cjs /tmp/boxblur.html /tmp/colab_gigi.png
-
-# 用 Node + Dawn 无头运行 Gigi 的 WebGPU 测试（先在测试根目录 npm install webgpu pngjs）
-python3 experiments/dawn-node/run_gigi_tests.py $GIGI/_GeneratedCode/UnitTests/WebGPU \
-    /path/to/chrome-linux64/vk_swiftshader_icd.json
+# 在真实的 Colab 前端里检查 notebook 的每个画面（匿名，不需要运行时）
+node tests/colab_open.cjs \
+  "https://colab.research.google.com/github/x380kkm/colabgraphics/blob/first-slice/notebooks/01_first_steps.ipynb" /tmp/nb
 ```
 
-`anon_*.cjs` 的做法：打开 Colab 的 GitHub notebook 地址，在浏览器里拦截它取 `.ipynb` 的请求，
-用本地文件作答。这样不需要发布任何东西，也不需要登录。
+`experiments/` 里各实验的用法见各自文件开头的注释。
