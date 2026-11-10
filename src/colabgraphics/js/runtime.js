@@ -29,6 +29,17 @@ export const FORMATS = {
 
 const SYS_SIZE = 32;  // struct Sys { time: f32, frame: u32, resolution: vec2f, mouse: vec4f }
 
+// Every mesh is one interleaved vertex buffer: position, normal, uv, colour (44 bytes).
+const VERTEX_LAYOUT = {
+  arrayStride: 44,
+  attributes: [
+    { shaderLocation: 0, offset: 0, format: 'float32x3' },
+    { shaderLocation: 1, offset: 12, format: 'float32x3' },
+    { shaderLocation: 2, offset: 24, format: 'float32x2' },
+    { shaderLocation: 3, offset: 32, format: 'float32x3' },
+  ],
+};
+
 async function inflate(base64) {
   const packed = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
   const stream = new Blob([packed]).stream().pipeThrough(new DecompressionStream('deflate'));
@@ -54,6 +65,7 @@ export class Runtime {
     this.values = {};
     this.errors = [];            // validation messages, each tagged with the pass it came from
     this.blits = new Map();
+    this.meshes = new Map();     // name -> { vertexBuffer, indexBuffer, vertexCount, indexCount }
   }
 
   async init() {
@@ -81,6 +93,19 @@ export class Runtime {
     this.varsData = new ArrayBuffer(Math.max(program.vars.size, 16));
     this.varsBuffer = device.createBuffer({ label: 'vars', size: this.varsData.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     for (const field of program.vars.fields) this.setVar(field.name, field.value);
+
+    for (const mesh of program.meshes || []) {
+      const vertices = await inflate(mesh.vertices);
+      const vertexBuffer = device.createBuffer({ label: mesh.name, size: vertices.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(vertexBuffer, 0, vertices);
+      let indexBuffer = null;
+      if (mesh.indices) {
+        const indices = await inflate(mesh.indices);
+        indexBuffer = device.createBuffer({ label: mesh.name + '.indices', size: indices.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+        device.queue.writeBuffer(indexBuffer, 0, indices);
+      }
+      this.meshes.set(mesh.name, { vertexBuffer, indexBuffer, vertexCount: mesh.vertexCount, indexCount: mesh.indexCount });
+    }
 
     this.samplers = {
       linear: device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' }),
@@ -144,6 +169,7 @@ export class Runtime {
         fragment: { module, entryPoint: pass.fragment, targets },
         primitive: { topology: pass.topology, cullMode: pass.cull },
       };
+      if (pass.mesh) descriptor.vertex.buffers = [VERTEX_LAYOUT];
       if (pass.depth) descriptor.depthStencil = { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' };
       built.pipeline = device.createRenderPipeline(descriptor);
     }
@@ -209,7 +235,18 @@ export class Runtime {
         const p = encoder.beginRenderPass(descriptor);
         p.setPipeline(built.pipeline);
         p.setBindGroup(0, built.bindGroup);
-        p.draw(pass.vertexCount, pass.instanceCount);
+        const mesh = pass.mesh && this.meshes.get(pass.mesh);
+        if (mesh) {
+          p.setVertexBuffer(0, mesh.vertexBuffer);
+          if (mesh.indexBuffer) {
+            p.setIndexBuffer(mesh.indexBuffer, 'uint32');
+            p.drawIndexed(mesh.indexCount, pass.instanceCount);
+          } else {
+            p.draw(mesh.vertexCount, pass.instanceCount);
+          }
+        } else {
+          p.draw(pass.vertexCount, pass.instanceCount);
+        }
         p.end();
       }
       encoder.popDebugGroup();
@@ -325,6 +362,7 @@ export class Runtime {
   destroy() {
     for (const { texture } of this.textures.values()) texture.destroy();
     this.varsBuffer.destroy();
+    for (const mesh of this.meshes.values()) { mesh.vertexBuffer.destroy(); if (mesh.indexBuffer) mesh.indexBuffer.destroy(); }
     for (const built of this.passes) built.sysBuffer.destroy();
   }
 }

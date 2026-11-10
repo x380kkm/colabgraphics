@@ -8,7 +8,10 @@
 资源创建、绑定、管线、每帧调度、变量界面这些样板由系统生成。
 描述和着色器写在 notebook 单元格里，渲染用 WebGPU 跑在读者自己的浏览器里。
 
-[![在 Colab 中打开](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/x380kkm/colabgraphics/blob/first-slice/notebooks/01_first_steps.ipynb)
+| notebook | 内容 | |
+|---|---|---|
+| 第一步 | 三角形、变量、两个 pass 的模糊、用 numpy 核对 | [![在 Colab 中打开](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/x380kkm/colabgraphics/blob/dev/notebooks/01_first_steps.ipynb) |
+| 第二步 | Blender 管场景和相机，自己的着色器渲染，与 Blender 的答案核对 | [![在 Colab 中打开](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/x380kkm/colabgraphics/blob/dev/notebooks/02_blender_scene.ipynb) |
 
 ![第一本 notebook 在未登录、未连接运行时的 Colab 里](docs/images/notebook_in_colab.jpg)
 
@@ -56,10 +59,36 @@ t.read(out, radius=4)   # 无头执行，返回 numpy 数组，用于断言
 | 运行时（`js/runtime.js`） | 同一个文件在浏览器和 Node + Dawn 下运行 |
 | 查看器（`js/viewer.js`、`display.py`） | 自包含 HTML 输出；每个变量一个控件；pass 流程条，点纹理名看中间结果 |
 | 无头执行（`headless.py`） | `read()` 返回 numpy；着色器报错指回作者的行号 |
-| 测试 | 浏览器与无头两条路径都和 numpy 参考实现比对；另有针对真实 Colab 前端的检查 |
+| Blender 桥（`blender.py`） | 场景取成数组（三角形、材质颜色、相机矩阵、灯光）；Blender 的光线求交给出深度与覆盖的参考；Cycles 渲染参考图 |
+| 测试 | 浏览器与无头两条路径都和 numpy 参考实现比对；光栅化结果与 Blender 的光线求交比对；另有针对真实 Colab 前端的检查 |
 
-还没有的：顶点和索引缓冲、采样器之外的资源类型、相机、逐 pass 的快照与像素探针、计时、
-内核连着时的实时工作台、图片的压缩存储。
+查看器里可以点纹理名看任意一步的结果、悬停读像素数值、暂停和单步。
+
+还没有的：采样器之外的资源类型（缓冲、三维纹理）、在画面里用鼠标转动相机、贴图材质、
+逐 pass 的时间线快照、计时、内核连着时的实时工作台、图片的压缩存储。
+
+## Blender 负责场景和相机
+
+Blender 作为 Python 模块（`pip install bpy`）跑在 notebook 的运行时里，没有窗口。
+
+```python
+from colabgraphics import blender
+
+blender.demo_scene()                      # 或者 blender.open("我的场景.blend")
+data = blender.scene(resolution=(512, 384))
+
+t = cg.Technique("scene")
+color = t.texture("color", size=data.resolution)
+mesh = t.mesh("scene", data.positions, data.normals, data.uvs, data.colors)
+t.var("view_projection", data.camera.view_projection)
+t.draw("raster", SHADER, targets=[color], mesh=mesh, depth=True)
+
+ref = blender.reference()                 # 每个像素该看到什么：深度、覆盖、法线
+picture = blender.render(samples=48)      # Cycles 对同一场景的渲染
+```
+
+矩阵按 WebGPU 的约定给出（深度范围 0 到 1）。在测试场景上，光栅化的覆盖范围与 Blender 光线求交的
+交并比为 0.9998，深度的中位误差约 5e-5 个场景单位。
 
 ## 架构
 
@@ -97,9 +126,17 @@ Colab VM（官方 [backend-info](https://github.com/googlecolab/backend-info)，
   13 个只在边缘像素有差异，3 个光追测试超时。所以跨实现的结果比较必须用容差。
 - Node 可以用 pip 装（PyPI 上的 `nodejs-wheel-binaries`）。
 
+Blender（同一台 Linux，Python 3.13）：
+
+- PyPI 上的 `bpy` 5.2.3 要求的 Python 版本正是 3.13，与 Colab 当前版本一致；安装约 40 秒，下载 403 MB。
+- 无头工作正常：建场景、取网格和相机数据、Cycles 用 CPU 渲染。还没在 Colab 的 VM 里实测。
+- `bpy` 只支持与 Blender 自带版本相同的 Python。Colab 升级 Python 后可能有一段时间装不上，
+  届时的退路是下载 Blender 压缩包并以子进程方式调用。
+
 尚未在真实 Colab 里测过的，都是需要登录才能执行的部分：
 
 - `read()` 的无头执行在 Colab 的 VM 里能否直接工作（那里没有 Node，驱动只有 Mesa 的 OpenGL ES）。
+- `pip install bpy` 之后 Blender 在 Colab 的 VM 里能否直接导入和渲染。
 - 内核与浏览器之间的通道（`eval_js`、comm、端口代理）。`experiments/colab-probe/colab_probe.ipynb` 是为此准备的探针。
 
 ## 目录
@@ -121,13 +158,14 @@ docs/images/          截图
 ```bash
 # 端到端测试：Python 描述 -> 浏览器或无头执行 -> 与 numpy 比对
 PYTHONPATH=src python3 tests/test_techniques.py
+PYTHONPATH=src python3 tests/test_blender.py        # 需要 pip install bpy
 
 # 重新生成 notebook（会执行其中的代码并保存输出）
 PYTHONPATH=src python3 tools/build_notebook.py notebooks/src/01_first_steps.py notebooks/01_first_steps.ipynb
 
 # 在真实的 Colab 前端里检查 notebook 的每个画面（匿名，不需要运行时）
 node tests/colab_open.cjs \
-  "https://colab.research.google.com/github/x380kkm/colabgraphics/blob/first-slice/notebooks/01_first_steps.ipynb" /tmp/nb
+  "https://colab.research.google.com/github/x380kkm/colabgraphics/blob/dev/notebooks/01_first_steps.ipynb" /tmp/nb
 ```
 
 `experiments/` 里各实验的用法见各自文件开头的注释。

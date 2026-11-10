@@ -8,7 +8,7 @@
 # 创建资源、绑定、管线、每帧调度这些，由系统生成。
 
 # %%
-%pip install -q git+https://github.com/x380kkm/colabgraphics@first-slice
+%pip install -q git+https://github.com/x380kkm/colabgraphics@dev
 import numpy as np
 import colabgraphics as cg
 

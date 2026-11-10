@@ -45,9 +45,17 @@ def run_cell(source, namespace):
     if stdout.getvalue():
         outputs.append({"output_type": "stream", "name": "stdout", "text": stdout.getvalue().splitlines(keepends=True)})
     if value is not None:
-        bundle = value._repr_mimebundle_() if hasattr(value, "_repr_mimebundle_") else {"text/plain": repr(value)}
+        if hasattr(value, "_repr_mimebundle_"):
+            bundle = value._repr_mimebundle_()
+        elif hasattr(value, "_repr_png_"):          # for example a PIL image
+            import base64
+            bundle = {"image/png": base64.b64encode(value._repr_png_()).decode(), "text/plain": repr(value)}
+        else:
+            bundle = {"text/plain": repr(value)}
         outputs.append({"output_type": "display_data", "metadata": {},
-                        "data": {k: (v.splitlines(keepends=True) if isinstance(v, str) else v) for k, v in bundle.items()}})
+                        # text is stored as a list of lines; binary types stay one base64 string
+                        "data": {k: (v.splitlines(keepends=True) if isinstance(v, str) and k.startswith("text/") else v)
+                                 for k, v in bundle.items()}})
     return outputs
 
 

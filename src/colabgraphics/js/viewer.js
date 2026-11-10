@@ -75,6 +75,7 @@ function mountViewer(root, program, options = {}) {
   const set = (name, value) => { pending.set(name, value); };
   const toHex = (v) => '#' + v.slice(0, 3).map((c) => Math.round(Math.min(Math.max(c, 0), 1) * 255).toString(16).padStart(2, '0')).join('');
   for (const f of program.vars.fields) {
+    if (f.ui === 'hidden') continue;   // matrices and the like: set from Python, not by hand
     const row = side.appendChild(el('label', 'cg-row'));
     const name = row.appendChild(el('span', 'cg-name', f.name));
     if (f.doc) name.title = f.doc;

@@ -44,7 +44,16 @@ VAR_TYPES = {
     "vec2f": ("f32", 2, 8, 8),
     "vec3f": ("f32", 3, 16, 12),
     "vec4f": ("f32", 4, 16, 16),
+    "mat4x4f": ("f32", 16, 16, 64),
 }
+
+# Every mesh uses this vertex layout: 44 bytes per vertex.
+VERTEX_STRUCT = """struct Vertex {
+  @location(0) position: vec3f,
+  @location(1) normal: vec3f,
+  @location(2) uv: vec2f,
+  @location(3) color: vec3f,
+}"""
 
 SYS_STRUCT = """struct Sys {
   time: f32,          // seconds since the technique started
@@ -70,6 +79,19 @@ class Texture:
 
     def __repr__(self):
         return f"Texture({self.name!r}, {self.size[0]}x{self.size[1]}, {self.format})"
+
+
+@dataclass(eq=False)
+class Mesh:
+    name: str
+    vertex_count: int
+    vertices: str             # interleaved float32 data, deflate-compressed, base64
+    index_count: int = 0
+    indices: str | None = None  # uint32 indices, same encoding
+
+    def __repr__(self):
+        shape = f"{self.index_count // 3} triangles, indexed" if self.index_count else f"{self.vertex_count // 3} triangles"
+        return f"Mesh({self.name!r}, {self.vertex_count} vertices, {shape})"
 
 
 @dataclass(eq=False)
@@ -111,6 +133,7 @@ class Technique:
         self.name = name
         self.textures: list[Texture] = []
         self.vars: list[Var] = []
+        self.meshes: list[Mesh] = []
         self.passes: list[Pass] = []
         self.view: Texture | None = None
 
@@ -171,11 +194,75 @@ class Technique:
         w, h = (max(1, round(s * scale)) for s in size)
         return self._add_texture(Texture(name, format or "rgba8unorm", (w, h)))
 
+    def mesh(self, name: str, positions, normals=None, uvs=None, colors=None, indices=None) -> Mesh:
+        """Triangles for draw passes. Arrays hold one row per vertex; `indices` is optional.
+
+        Without `indices`, every three vertices form a triangle. Missing normals are computed
+        per triangle, missing uvs are zero, and missing colors are white. A single colour
+        (three numbers) applies to all vertices.
+        """
+        self._check_name(name, "mesh")
+        if any(m.name == name for m in self.meshes):
+            raise TechniqueError(f'there is already a mesh named "{name}"')
+        pos = np.asarray(positions, np.float32)
+        if pos.ndim != 2 or pos.shape[1] != 3 or len(pos) == 0:
+            raise TechniqueError(f'mesh "{name}": positions must be shaped (vertices, 3), got {pos.shape}')
+        n = len(pos)
+        idx = None
+        if indices is not None:
+            idx = np.asarray(indices).astype(np.uint32).reshape(-1)
+            if len(idx) % 3 or (len(idx) and idx.max() >= n):
+                raise TechniqueError(f'mesh "{name}": indices must come in threes and refer to existing vertices')
+        elif n % 3:
+            raise TechniqueError(f'mesh "{name}": without indices the vertex count must be a multiple of 3, got {n}')
+
+        def per_vertex(values, width, what, default):
+            if values is None:
+                return default()
+            a = np.asarray(values, np.float32)
+            if a.shape == (width,):
+                return np.broadcast_to(a, (n, width))
+            if a.shape != (n, width):
+                raise TechniqueError(f'mesh "{name}": {what} must be shaped ({n}, {width}), got {a.shape}')
+            return a
+
+        def face_normals():
+            tri = pos[idx].reshape(-1, 3, 3) if idx is not None else pos.reshape(-1, 3, 3)
+            fn = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+            fn /= np.maximum(np.linalg.norm(fn, axis=1, keepdims=True), 1e-20)
+            if idx is None:
+                return np.repeat(fn, 3, axis=0)
+            out = np.zeros((n, 3), np.float32)       # indexed: average the faces around each vertex
+            np.add.at(out, idx, np.repeat(fn, 3, axis=0))
+            return out / np.maximum(np.linalg.norm(out, axis=1, keepdims=True), 1e-20)
+
+        data = np.empty((n, 11), np.float32)
+        data[:, 0:3] = pos
+        data[:, 3:6] = per_vertex(normals, 3, "normals", face_normals)
+        data[:, 6:8] = per_vertex(uvs, 2, "uvs", lambda: np.zeros((n, 2), np.float32))
+        data[:, 8:11] = per_vertex(colors, 3, "colors", lambda: np.ones((n, 3), np.float32))
+        mesh = Mesh(name, n, _pack(data), 0 if idx is None else len(idx), None if idx is None else _pack(idx))
+        self.meshes.append(mesh)
+        return mesh
+
     def var(self, name: str, value, min=None, max=None, step=None, doc: str = "", color: bool = False) -> Var:
-        """A value the reader can change while the technique runs. Shaders read it as vars.<name>."""
+        """A value the reader can change while the technique runs. Shaders read it as vars.<name>.
+
+        A 4x4 numpy array becomes a mat4x4f (given in the usual maths layout, where the
+        matrix multiplies a column vector); it gets no control in the viewer.
+        """
         self._check_name(name, "variable")
         if any(v.name == name for v in self.vars):
             raise TechniqueError(f'there is already a variable named "{name}"')
+        if isinstance(value, np.ndarray) and value.shape == (4, 4):
+            # WGSL stores matrices column by column.
+            var = Var(name, "mat4x4f", [float(x) for x in value.T.reshape(-1)], ui="hidden", doc=doc)
+            self.vars.append(var)
+            return var
+        if isinstance(value, np.ndarray) and value.ndim == 1:
+            value = tuple(float(x) for x in value)
+        elif isinstance(value, np.generic):
+            value = value.item()
         if isinstance(value, bool):
             wgsl, ui = "u32", "checkbox"
         elif isinstance(value, int):
@@ -228,10 +315,17 @@ class Technique:
     def draw(self, name: str, code: str, targets: list[Texture], reads: dict | None = None,
              vertices: int = 3, instances: int = 1, vertex: str = "vs", fragment: str = "fs",
              clear: tuple | None = (0, 0, 0, 1), depth: Texture | bool | None = None,
-             topology: str = "triangle-list", cull: str = "none") -> Pass:
-        """Rasterize `vertices` vertices into `targets`. Geometry comes from the vertex shader."""
+             topology: str = "triangle-list", cull: str = "none", mesh: Mesh | None = None) -> Pass:
+        """Rasterize into `targets`.
+
+        With `mesh=`, the vertex shader receives that mesh's vertices as a `Vertex` struct.
+        Without it, `vertices` vertices are drawn and the vertex shader makes up the geometry
+        from the vertex index.
+        """
         if not targets:
             raise TechniqueError(f'pass "{name}": give at least one texture in targets=[...]')
+        if mesh is not None and mesh not in self.meshes:
+            raise TechniqueError(f'pass "{name}": {mesh!r} is not a mesh of this technique')
         for tex in targets:
             self._owns(tex, name)
             if tex in (reads or {}).values():
@@ -245,7 +339,8 @@ class Technique:
         self.view = targets[0]
         return self._add_pass(Pass("draw", name, code, dict(reads or {}), {
             "targets": list(targets), "vertices": vertices, "instances": instances, "vertex": vertex,
-            "fragment": fragment, "clear": clear, "depth": depth or None, "topology": topology, "cull": cull}))
+            "fragment": fragment, "clear": clear, "depth": depth or None, "topology": topology, "cull": cull,
+            "mesh": mesh}))
 
     # ---- compile -------------------------------------------------------------
 
@@ -284,6 +379,8 @@ class Technique:
         if re.search(r"(?<![A-Za-z0-9_.])sys\.", code):
             lines.append(SYS_STRUCT)
             bind({"kind": "sys"}, "var<uniform> sys: Sys;")
+        if p.options.get("mesh") and _uses(code, "Vertex") and not re.search(r"struct\s+Vertex\b", code):
+            lines.append(VERTEX_STRUCT)
         for wgsl_name, tex in p.reads.items():
             bind({"kind": "texture", "name": wgsl_name, "texture": tex.name}, f"var {wgsl_name}: {FORMATS[tex.format][1]};")
         for wgsl_name, tex in p.options.get("writes", {}).items():
@@ -334,13 +431,16 @@ class Technique:
                 out.update(vertex=o["vertex"], fragment=o["fragment"], vertexCount=o["vertices"],
                            instanceCount=o["instances"], topology=o["topology"], cull=o["cull"],
                            targets=[{"texture": t.name, "clear": list(o["clear"]) if o["clear"] else None} for t in o["targets"]],
-                           depth={"texture": o["depth"].name} if o["depth"] else None)
+                           depth={"texture": o["depth"].name} if o["depth"] else None,
+                           mesh=o["mesh"].name if o["mesh"] else None)
             passes.append(out)
         return Program({
             "name": self.name,
             "textures": [{"name": t.name, "format": t.format, "size": list(t.size), **({"data": t.data} if t.data else {})}
                          for t in self.textures],
             "vars": self._layout_vars(),
+            "meshes": [{"name": m.name, "vertexCount": m.vertex_count, "vertices": m.vertices,
+                        "indexCount": m.index_count, **({"indices": m.indices} if m.indices else {})} for m in self.meshes],
             "passes": passes,
             "view": (self.view or self.textures[0]).name,
         }, warnings)
@@ -353,15 +453,20 @@ class Technique:
 
         return show(self.compile(), view=texture.name if texture else None, **options)
 
-    def read(self, texture: Texture, frames: int = 1, **vars) -> np.ndarray:
+    def read(self, texture, frames: int = 1, **vars):
         """Run the technique without a browser and return `texture` as an array (height, width, channels).
 
-        Keyword arguments set variables for this run, for example `t.read(out, radius=4)`.
+        Give a list of textures to get a list of arrays from the same run. Keyword arguments
+        set variables for this run, for example `t.read(out, radius=4)`.
         """
         from . import headless
 
-        self._owns(texture, "read")
-        return headless.run(self.compile(), read=[texture.name], frames=frames, vars=vars)[texture.name]
+        many = isinstance(texture, (list, tuple))
+        textures = list(texture) if many else [texture]
+        for tex in textures:
+            self._owns(tex, "read")
+        arrays = headless.run(self.compile(), read=[tex.name for tex in textures], frames=frames, vars=vars)
+        return [arrays[tex.name] for tex in textures] if many else arrays[texture.name]
 
 
 class Program:
