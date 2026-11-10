@@ -110,6 +110,32 @@ def test_triangle_covers_expected_pixels():
     assert abs(dim[80, 64, :3].astype(float).sum() / 255 - 0.5) < 0.03
 
 
+def test_headless_matches_numpy_and_browser():
+    rng = np.random.default_rng(11)
+    image = np.dstack([rng.integers(0, 256, (40, 56, 3), dtype=np.uint8), np.full((40, 56), 255, np.uint8)])
+    technique = make_boxblur(image)
+    out = next(t for t in technique.textures if t.name == "out")
+    headless = technique.read(out, radius=4)
+    expected = box_blur_reference(image, 4)
+    assert int(np.abs(headless.astype(int) - expected.astype(int)).max()) <= 2
+    _, browser = run_in_browser(technique, "out", "radius=4")
+    assert int(np.abs(headless.astype(int) - browser.astype(int)).max()) <= 2
+
+
+def test_headless_reports_shader_errors_on_the_authors_line():
+    from colabgraphics.headless import HeadlessError
+
+    t = cg.Technique("bad")
+    o = t.texture("o", size=(8, 8))
+    code = "@compute @workgroup_size(1)\nfn main(@builtin(global_invocation_id) id: vec3u) {\n  textureStore(o, id.xy, vec4f(1.0) * nope);\n}\n"
+    t.compute("p", code, writes={"o": o})
+    try:
+        t.read(o)
+        raise AssertionError("expected a shader error")
+    except HeadlessError as e:
+        assert 'pass "p", line 3' in str(e) and "nope" in str(e), str(e)
+
+
 def test_errors_name_the_problem():
     t = cg.Technique("bad")
     a = t.texture("a", size=(8, 8))

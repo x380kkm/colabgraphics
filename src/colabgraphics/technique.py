@@ -353,6 +353,16 @@ class Technique:
 
         return show(self.compile(), view=texture.name if texture else None, **options)
 
+    def read(self, texture: Texture, frames: int = 1, **vars) -> np.ndarray:
+        """Run the technique without a browser and return `texture` as an array (height, width, channels).
+
+        Keyword arguments set variables for this run, for example `t.read(out, radius=4)`.
+        """
+        from . import headless
+
+        self._owns(texture, "read")
+        return headless.run(self.compile(), read=[texture.name], frames=frames, vars=vars)[texture.name]
+
 
 class Program:
     """A compiled technique: JSON for the runtime, plus what the compiler noticed."""
